@@ -1,23 +1,26 @@
+//+build darwin,macnative
+
 package native
 
 // #include "threads_darwin.h"
 // #include "proc_darwin.h"
 import "C"
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 
 	sys "golang.org/x/sys/unix"
 
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
-// WaitStatus is a synonym for the platform-specific WaitStatus
-type WaitStatus sys.WaitStatus
+// waitStatus is a synonym for the platform-specific WaitStatus
+type waitStatus sys.WaitStatus
 
-// OSSpecificDetails holds information specific to the OSX/Darwin
+// osSpecificDetails holds information specific to the OSX/Darwin
 // operating system / kernel.
-type OSSpecificDetails struct {
+type osSpecificDetails struct {
 	threadAct C.thread_act_t
 	registers C.x86_thread_state64_t
 	exists    bool
@@ -27,7 +30,7 @@ type OSSpecificDetails struct {
 // be continued.
 var ErrContinueThread = fmt.Errorf("could not continue thread")
 
-func (t *Thread) stop() (err error) {
+func (t *nativeThread) stop() (err error) {
 	kret := C.thread_suspend(t.os.threadAct)
 	if kret != C.KERN_SUCCESS {
 		errStr := C.GoString(C.mach_error_string(C.mach_error_t(kret)))
@@ -46,7 +49,7 @@ func (t *Thread) stop() (err error) {
 	return
 }
 
-func (t *Thread) singleStep() error {
+func (t *nativeThread) singleStep() error {
 	kret := C.single_step(t.os.threadAct)
 	if kret != C.KERN_SUCCESS {
 		return fmt.Errorf("could not single step")
@@ -68,10 +71,10 @@ func (t *Thread) singleStep() error {
 	return nil
 }
 
-func (t *Thread) resume() error {
+func (t *nativeThread) resume() error {
 	// TODO(dp) set flag for ptrace stops
 	var err error
-	t.dbp.execPtraceFunc(func() { err = PtraceCont(t.dbp.pid, 0) })
+	t.dbp.execPtraceFunc(func() { err = ptraceCont(t.dbp.pid, 0) })
 	if err == nil {
 		return nil
 	}
@@ -82,9 +85,9 @@ func (t *Thread) resume() error {
 	return nil
 }
 
-func (t *Thread) Blocked() bool {
+func (t *nativeThread) Blocked() bool {
 	// TODO(dp) cache the func pc to remove this lookup
-	regs, err := t.Registers(false)
+	regs, err := t.Registers()
 	if err != nil {
 		return false
 	}
@@ -103,13 +106,13 @@ func (t *Thread) Blocked() bool {
 
 // Stopped returns whether the thread is stopped at
 // the operating system level.
-func (t *Thread) Stopped() bool {
+func (t *nativeThread) Stopped() bool {
 	return C.thread_blocked(t.os.threadAct) > C.int(0)
 }
 
-func (t *Thread) WriteMemory(addr uintptr, data []byte) (int, error) {
+func (t *nativeThread) WriteMemory(addr uintptr, data []byte) (int, error) {
 	if t.dbp.exited {
-		return 0, proc.ProcessExitedError{Pid: t.dbp.pid}
+		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
 	if len(data) == 0 {
 		return 0, nil
@@ -125,9 +128,9 @@ func (t *Thread) WriteMemory(addr uintptr, data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (t *Thread) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (t *nativeThread) ReadMemory(buf []byte, addr uintptr) (int, error) {
 	if t.dbp.exited {
-		return 0, proc.ProcessExitedError{Pid: t.dbp.pid}
+		return 0, proc.ErrProcessExited{Pid: t.dbp.pid}
 	}
 	if len(buf) == 0 {
 		return 0, nil
@@ -143,4 +146,8 @@ func (t *Thread) ReadMemory(buf []byte, addr uintptr) (int, error) {
 		return 0, fmt.Errorf("could not read memory")
 	}
 	return len(buf), nil
+}
+
+func (t *nativeThread) restoreRegisters(sr proc.Registers) error {
+	return errors.New("not implemented")
 }

@@ -4,13 +4,12 @@ package proc_test
 
 import (
 	"fmt"
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/derekparker/delve/pkg/proc"
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/proc"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 type errIssue419 struct {
@@ -23,10 +22,6 @@ func (npe errIssue419) Error() string {
 }
 
 func TestIssue419(t *testing.T) {
-	if testBackend == "lldb" && runtime.GOOS == "darwin" {
-		// debugserver bug?
-		return
-	}
 	if testBackend == "rr" {
 		return
 	}
@@ -34,11 +29,10 @@ func TestIssue419(t *testing.T) {
 	errChan := make(chan error, 2)
 
 	// SIGINT directed at the inferior should be passed along not swallowed by delve
-	withTestProcess("issue419", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("issue419", t, func(p *proc.Target, fixture protest.Fixture) {
 		defer close(errChan)
-		_, err := setFunctionBreakpoint(p, "main.main")
-		assertNoError(err, t, "SetBreakpoint()")
-		assertNoError(proc.Continue(p), t, "Continue()")
+		setFunctionBreakpoint(p, t, "main.main")
+		assertNoError(p.Continue(), t, "Continue()")
 		resumeChan := make(chan struct{}, 1)
 		go func() {
 			time.Sleep(500 * time.Millisecond)
@@ -54,7 +48,7 @@ func TestIssue419(t *testing.T) {
 			errChan <- errIssue419{pid: p.Pid(), err: err}
 		}()
 		p.ResumeNotify(resumeChan)
-		errChan <- proc.Continue(p)
+		errChan <- p.Continue()
 	})
 
 	for i := 0; i < 2; i++ {
@@ -65,7 +59,7 @@ func TestIssue419(t *testing.T) {
 			continue
 		}
 
-		if _, exited := err.(proc.ProcessExitedError); !exited {
+		if _, exited := err.(proc.ErrProcessExited); !exited {
 			t.Fatalf("Unexpected error after Continue(): %v\n", err)
 		}
 	}

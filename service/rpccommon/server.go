@@ -3,26 +3,25 @@ package rpccommon
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/rpc"
 	"net/rpc/jsonrpc"
+	"os"
 	"reflect"
 	"runtime"
 	"sync"
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/derekparker/delve/pkg/logflags"
-	"github.com/derekparker/delve/pkg/version"
-	"github.com/derekparker/delve/service"
-	"github.com/derekparker/delve/service/api"
-	"github.com/derekparker/delve/service/debugger"
-	"github.com/derekparker/delve/service/rpc1"
-	"github.com/derekparker/delve/service/rpc2"
+	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/go-delve/delve/pkg/version"
+	"github.com/go-delve/delve/service"
+	"github.com/go-delve/delve/service/api"
+	"github.com/go-delve/delve/service/debugger"
+	"github.com/go-delve/delve/service/rpc1"
+	"github.com/go-delve/delve/service/rpc2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -68,17 +67,14 @@ type methodType struct {
 
 // NewServer creates a new RPCServer.
 func NewServer(config *service.Config) *ServerImpl {
-	logger := logrus.New().WithFields(logrus.Fields{"layer": "rpc"})
-	logger.Logger.Level = logrus.DebugLevel
-	if !logflags.RPC() {
-		logger.Logger.Out = ioutil.Discard
-	}
+	logger := logflags.RPCLogger()
 	if config.APIVersion < 2 {
 		logger.Info("Using API v1")
 	}
-	if config.Foreground {
+	if config.Debugger.Foreground {
 		// Print listener address
-		fmt.Printf("API server listening at: %s\n", config.Listener.Addr())
+		logflags.WriteAPIListeningMessage(config.Listener.Addr().String())
+		logger.Debug("API server pid = ", os.Getpid())
 	}
 	return &ServerImpl{
 		config:   config,
@@ -94,16 +90,8 @@ func (s *ServerImpl) Stop() error {
 		close(s.stopChan)
 		s.listener.Close()
 	}
-	kill := s.config.AttachPid == 0
+	kill := s.config.Debugger.AttachPid == 0
 	return s.debugger.Detach(kill)
-}
-
-// Restart restarts the debugger.
-func (s *ServerImpl) Restart() error {
-	if s.config.AttachPid != 0 {
-		return errors.New("cannot restart process Delve did not create")
-	}
-	return s.s2.Restart(rpc2.RestartIn{}, nil)
 }
 
 // Run starts a debugger and exposes it with an HTTP server. The debugger
@@ -120,14 +108,8 @@ func (s *ServerImpl) Run() error {
 	}
 
 	// Create and start the debugger
-	if s.debugger, err = debugger.New(&debugger.Config{
-		AttachPid:  s.config.AttachPid,
-		WorkingDir: s.config.WorkingDir,
-		CoreFile:   s.config.CoreFile,
-		Backend:    s.config.Backend,
-		Foreground: s.config.Foreground,
-	},
-		s.config.ProcessArgs); err != nil {
+	config := s.config.Debugger
+	if s.debugger, err = debugger.New(&config, s.config.ProcessArgs); err != nil {
 		return err
 	}
 
@@ -158,6 +140,14 @@ func (s *ServerImpl) Run() error {
 					panic(err)
 				}
 			}
+
+			if s.config.CheckLocalConnUser {
+				if !canAccept(s.listener.Addr(), c.RemoteAddr()) {
+					c.Close()
+					continue
+				}
+			}
+
 			go s.serveJSONCodec(c)
 			if !s.config.AcceptMulti {
 				break
@@ -281,6 +271,7 @@ func (s *ServerImpl) serveJSONCodec(conn io.ReadWriteCloser) {
 		mtype, ok := s.methodMaps[s.config.APIVersion-1][req.ServiceMethod]
 		if !ok {
 			s.log.Errorf("rpc: can't find method %s", req.ServiceMethod)
+			s.sendResponse(sending, &req, &rpc.Response{}, nil, codec, fmt.Sprintf("unknown method: %s", req.ServiceMethod))
 			continue
 		}
 
@@ -389,7 +380,7 @@ func (cb *RPCCallback) Return(out interface{}, err error) {
 func (s *RPCServer) GetVersion(args api.GetVersionIn, out *api.GetVersionOut) error {
 	out.DelveVersion = version.DelveVersion.String()
 	out.APIVersion = s.s.config.APIVersion
-	return nil
+	return s.s.debugger.GetVersion(out)
 }
 
 // Changes version of the API being served.

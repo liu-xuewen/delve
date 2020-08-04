@@ -7,20 +7,23 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/derekparker/delve/pkg/dwarf/util"
+	"github.com/go-delve/delve/pkg/dwarf/util"
 )
 
+// Opcode represent a DWARF stack program instruction.
+// See ./opcodes.go for a full list.
 type Opcode byte
 
-//go:generate go run ../../../scripts/gen-opcodes.go opcodes.table opcodes.go
+//go:generate go run ../../../_scripts/gen-opcodes.go opcodes.table opcodes.go
 
 type stackfn func(Opcode, *context) error
 
 type context struct {
-	buf    *bytes.Buffer
-	stack  []int64
-	pieces []Piece
-	reg    bool
+	buf     *bytes.Buffer
+	stack   []int64
+	pieces  []Piece
+	reg     bool
+	ptrSize int
 
 	DwarfRegisters
 }
@@ -36,11 +39,12 @@ type Piece struct {
 // ExecuteStackProgram executes a DWARF location expression and returns
 // either an address (int64), or a slice of Pieces for location expressions
 // that don't evaluate to an address (such as register and composite expressions).
-func ExecuteStackProgram(regs DwarfRegisters, instructions []byte) (int64, []Piece, error) {
+func ExecuteStackProgram(regs DwarfRegisters, instructions []byte, ptrSize int) (int64, []Piece, error) {
 	ctxt := &context{
 		buf:            bytes.NewBuffer(instructions),
 		stack:          make([]int64, 0, 3),
 		DwarfRegisters: regs,
+		ptrSize:        ptrSize,
 	}
 
 	for {
@@ -50,7 +54,11 @@ func ExecuteStackProgram(regs DwarfRegisters, instructions []byte) (int64, []Pie
 		}
 		opcode := Opcode(opcodeByte)
 		if ctxt.reg && opcode != DW_OP_piece {
-			break
+			// last opcode was DW_OP_regN and next one isn't DW_OP_piece so convert
+			// the register piece into a stack value.
+			ctxt.stack = append(ctxt.stack, int64(regs.Uint64Val(ctxt.pieces[len(ctxt.pieces)-1].RegNum)))
+			ctxt.pieces = ctxt.pieces[:len(ctxt.pieces)-1]
+			ctxt.reg = false
 		}
 		fn, ok := oplut[opcode]
 		if !ok {
@@ -64,6 +72,9 @@ func ExecuteStackProgram(regs DwarfRegisters, instructions []byte) (int64, []Pie
 	}
 
 	if ctxt.pieces != nil {
+		if len(ctxt.pieces) == 1 && ctxt.pieces[0].IsRegister {
+			return int64(regs.Uint64Val(ctxt.pieces[0].RegNum)), ctxt.pieces, nil
+		}
 		return 0, ctxt.pieces, nil
 	}
 
@@ -74,7 +85,7 @@ func ExecuteStackProgram(regs DwarfRegisters, instructions []byte) (int64, []Pie
 	return ctxt.stack[len(ctxt.stack)-1], nil, nil
 }
 
-// PrettyPrint prints instructions to out.
+// PrettyPrint prints the DWARF stack program instructions to `out`.
 func PrettyPrint(out io.Writer, instructions []byte) {
 	in := bytes.NewBuffer(instructions)
 
@@ -133,7 +144,12 @@ func callframecfa(opcode Opcode, ctxt *context) error {
 }
 
 func addr(opcode Opcode, ctxt *context) error {
-	ctxt.stack = append(ctxt.stack, int64(binary.LittleEndian.Uint64(ctxt.buf.Next(8))))
+	buf := ctxt.buf.Next(ctxt.ptrSize)
+	stack, err := util.ReadUintRaw(bytes.NewReader(buf), binary.LittleEndian, ctxt.ptrSize)
+	if err != nil {
+		return err
+	}
+	ctxt.stack = append(ctxt.stack, int64(stack+ctxt.StaticBase))
 	return nil
 }
 

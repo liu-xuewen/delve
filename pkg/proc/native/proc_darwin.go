@@ -1,3 +1,5 @@
+//+build darwin,macnative
+
 package native
 
 // #include "proc_darwin.h"
@@ -11,16 +13,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"unsafe"
 
 	sys "golang.org/x/sys/unix"
 
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
-// OSProcessDetails holds Darwin specific information.
-type OSProcessDetails struct {
+// osProcessDetails holds Darwin specific information.
+type osProcessDetails struct {
 	task             C.task_t      // mach task for the debugged process.
 	exceptionPort    C.mach_port_t // mach port for receiving mach exceptions.
 	notificationPort C.mach_port_t // mach port for dead name notification (process exit).
@@ -36,11 +37,7 @@ type OSProcessDetails struct {
 // custom fork/exec process in order to take advantage of
 // PT_SIGEXC on Darwin which will turn Unix signals into
 // Mach exceptions.
-func Launch(cmd []string, wd string, foreground bool) (*Process, error) {
-	// check that the argument to Launch is an executable file
-	if fi, staterr := os.Stat(cmd[0]); staterr == nil && (fi.Mode()&0111) == 0 {
-		return nil, proc.NotExecutableErr
-	}
+func Launch(cmd []string, wd string, foreground bool, _ []string, _ string) (*proc.Target, error) {
 	argv0Go, err := filepath.Abs(cmd[0])
 	if err != nil {
 		return nil, err
@@ -63,7 +60,12 @@ func Launch(cmd []string, wd string, foreground bool) (*Process, error) {
 	// argv array must be null terminated.
 	argvSlice = append(argvSlice, nil)
 
-	dbp := New(0)
+	dbp := newProcess(0)
+	defer func() {
+		if err != nil && dbp.pid != 0 {
+			_ = dbp.Detach(true)
+		}
+	}()
 	var pid int
 	dbp.execPtraceFunc(func() {
 		ret := C.fork_exec(argv0, &argvSlice[0], C.int(len(argvSlice)),
@@ -103,7 +105,6 @@ func Launch(cmd []string, wd string, foreground bool) (*Process, error) {
 		return nil, err
 	}
 
-	dbp.common.ClearAllGCache()
 	for _, th := range dbp.threads {
 		th.CurrentBreakpoint.Clear()
 	}
@@ -117,21 +118,19 @@ func Launch(cmd []string, wd string, foreground bool) (*Process, error) {
 	}
 
 	dbp.os.initialized = true
-	dbp, err = initializeDebugProcess(dbp, argv0Go)
+	dbp.currentThread = trapthread
+
+	tgt, err := dbp.initialize(argv0Go, []string{})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := dbp.SwitchThread(trapthread.ID); err != nil {
-		return nil, err
-	}
-
-	return dbp, err
+	return tgt, err
 }
 
 // Attach to an existing process with the given PID.
-func Attach(pid int) (*Process, error) {
-	dbp := New(pid)
+func Attach(pid int, _ []string) (*proc.Target, error) {
+	dbp := newProcess(pid)
 
 	kret := C.acquire_mach_task(C.int(pid),
 		&dbp.os.task, &dbp.os.portSet, &dbp.os.exceptionPort,
@@ -144,7 +143,7 @@ func Attach(pid int) (*Process, error) {
 	dbp.os.initialized = true
 
 	var err error
-	dbp.execPtraceFunc(func() { err = PtraceAttach(dbp.pid) })
+	dbp.execPtraceFunc(func() { err = ptraceAttach(dbp.pid) })
 	if err != nil {
 		return nil, err
 	}
@@ -153,16 +152,16 @@ func Attach(pid int) (*Process, error) {
 		return nil, err
 	}
 
-	dbp, err = initializeDebugProcess(dbp, "")
+	tgt, err := dbp.initialize("", []string{})
 	if err != nil {
 		dbp.Detach(false)
 		return nil, err
 	}
-	return dbp, nil
+	return tgt, nil
 }
 
 // Kill kills the process.
-func (dbp *Process) kill() (err error) {
+func (dbp *nativeProcess) kill() (err error) {
 	if dbp.exited {
 		return nil
 	}
@@ -186,7 +185,7 @@ func (dbp *Process) kill() (err error) {
 	return
 }
 
-func (dbp *Process) requestManualStop() (err error) {
+func (dbp *nativeProcess) requestManualStop() (err error) {
 	var (
 		task          = C.mach_port_t(dbp.os.task)
 		thread        = C.mach_port_t(dbp.currentThread.os.threadAct)
@@ -203,11 +202,11 @@ func (dbp *Process) requestManualStop() (err error) {
 var couldNotGetThreadCount = errors.New("could not get thread count")
 var couldNotGetThreadList = errors.New("could not get thread list")
 
-func (dbp *Process) updateThreadList() error {
+func (dbp *nativeProcess) updateThreadList() error {
 	return dbp.updateThreadListForTask(dbp.os.task)
 }
 
-func (dbp *Process) updateThreadListForTask(task C.task_t) error {
+func (dbp *nativeProcess) updateThreadListForTask(task C.task_t) error {
 	var (
 		err   error
 		kret  C.kern_return_t
@@ -257,19 +256,19 @@ func (dbp *Process) updateThreadListForTask(task C.task_t) error {
 	return nil
 }
 
-func (dbp *Process) addThread(port int, attach bool) (*Thread, error) {
+func (dbp *nativeProcess) addThread(port int, attach bool) (*nativeThread, error) {
 	if thread, ok := dbp.threads[port]; ok {
 		return thread, nil
 	}
-	thread := &Thread{
+	thread := &nativeThread{
 		ID:  port,
 		dbp: dbp,
-		os:  new(OSSpecificDetails),
+		os:  new(osSpecificDetails),
 	}
 	dbp.threads[port] = thread
 	thread.os.threadAct = C.thread_act_t(port)
 	if dbp.currentThread == nil {
-		dbp.SwitchThread(thread.ID)
+		dbp.currentThread = thread
 	}
 	return thread, nil
 }
@@ -281,7 +280,7 @@ func findExecutable(path string, pid int) string {
 	return path
 }
 
-func (dbp *Process) trapWait(pid int) (*Thread, error) {
+func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
 	for {
 		task := dbp.os.task
 		port := C.mach_port_wait(dbp.os.portSet, &task, C.int(0))
@@ -305,7 +304,7 @@ func (dbp *Process) trapWait(pid int) (*Thread, error) {
 				return nil, err
 			}
 			dbp.postExit()
-			return nil, proc.ProcessExitedError{Pid: dbp.pid, Status: status.ExitStatus()}
+			return nil, proc.ErrProcessExited{Pid: dbp.pid, Status: status.ExitStatus()}
 
 		case C.MACH_RCV_INTERRUPTED:
 			dbp.stopMu.Lock()
@@ -359,7 +358,7 @@ func (dbp *Process) trapWait(pid int) (*Thread, error) {
 	}
 }
 
-func (dbp *Process) waitForStop() ([]int, error) {
+func (dbp *nativeProcess) waitForStop() ([]int, error) {
 	ports := make([]int, 0, len(dbp.threads))
 	count := 0
 	for {
@@ -381,11 +380,7 @@ func (dbp *Process) waitForStop() ([]int, error) {
 	}
 }
 
-func (dbp *Process) loadProcessInformation(wg *sync.WaitGroup) {
-	wg.Done()
-}
-
-func (dbp *Process) wait(pid, options int) (int, *sys.WaitStatus, error) {
+func (dbp *nativeProcess) wait(pid, options int) (int, *sys.WaitStatus, error) {
 	var status sys.WaitStatus
 	wpid, err := sys.Wait4(pid, &status, options, nil)
 	return wpid, &status, err
@@ -395,19 +390,19 @@ func killProcess(pid int) error {
 	return sys.Kill(pid, sys.SIGINT)
 }
 
-func (dbp *Process) exitGuard(err error) error {
+func (dbp *nativeProcess) exitGuard(err error) error {
 	if err != ErrContinueThread {
 		return err
 	}
 	_, status, werr := dbp.wait(dbp.pid, sys.WNOHANG)
 	if werr == nil && status.Exited() {
 		dbp.postExit()
-		return proc.ProcessExitedError{Pid: dbp.pid, Status: status.ExitStatus()}
+		return proc.ErrProcessExited{Pid: dbp.pid, Status: status.ExitStatus()}
 	}
 	return err
 }
 
-func (dbp *Process) resume() error {
+func (dbp *nativeProcess) resume() error {
 	// all threads stopped over a breakpoint are made to step over it
 	for _, thread := range dbp.threads {
 		if thread.CurrentBreakpoint.Breakpoint != nil {
@@ -427,9 +422,9 @@ func (dbp *Process) resume() error {
 }
 
 // stop stops all running threads and sets breakpoints
-func (dbp *Process) stop(trapthread *Thread) (err error) {
+func (dbp *nativeProcess) stop(trapthread *nativeThread) (err error) {
 	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
 	for _, th := range dbp.threads {
 		if !th.Stopped() {
@@ -446,10 +441,10 @@ func (dbp *Process) stop(trapthread *Thread) (err error) {
 	if !dbp.os.initialized {
 		return nil
 	}
-	trapthread.SetCurrentBreakpoint()
+	trapthread.SetCurrentBreakpoint(true)
 	for _, port := range ports {
 		if th, ok := dbp.threads[port]; ok {
-			err := th.SetCurrentBreakpoint()
+			err := th.SetCurrentBreakpoint(true)
 			if err != nil {
 				return err
 			}
@@ -458,6 +453,13 @@ func (dbp *Process) stop(trapthread *Thread) (err error) {
 	return nil
 }
 
-func (dbp *Process) detach(kill bool) error {
-	return PtraceDetach(dbp.pid, 0)
+func (dbp *nativeProcess) detach(kill bool) error {
+	return ptraceDetach(dbp.pid, 0)
 }
+
+func (dbp *nativeProcess) EntryPoint() (uint64, error) {
+	//TODO(aarzilli): implement this
+	return 0, nil
+}
+
+func initialize(dbp *nativeProcess) error { return nil }

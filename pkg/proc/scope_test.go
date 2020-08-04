@@ -13,18 +13,18 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/goversion"
-	"github.com/derekparker/delve/pkg/proc"
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/proc"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 func TestScopeWithEscapedVariable(t *testing.T) {
-	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 3, 0, ""}) {
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 9, Rev: -1, Beta: 3}) {
 		return
 	}
 
-	withTestProcess("scopeescapevareval", t, func(p proc.Process, fixture protest.Fixture) {
-		assertNoError(proc.Continue(p), t, "Continue")
+	withTestProcess("scopeescapevareval", t, func(p *proc.Target, fixture protest.Fixture) {
+		assertNoError(p.Continue(), t, "Continue")
 
 		// On the breakpoint there are two 'a' variables in scope, the one that
 		// isn't shadowed is a variable that escapes to the heap and figures in
@@ -58,11 +58,12 @@ func TestScopeWithEscapedVariable(t *testing.T) {
 // the = and the initial value are optional and can only be specified if the
 // type is an integer type, float32, float64 or bool.
 //
-// If multiple variables with the same name are specified
-// LocalVariables+FunctionArguments should return them in the same order and
-// EvalExpression should return the last one.
+// If multiple variables with the same name are specified:
+// 1. LocalVariables+FunctionArguments should return them in the same order and
+//    every variable except the last one should be marked as shadowed
+// 2. EvalExpression should return the last one.
 func TestScope(t *testing.T) {
-	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 9, Rev: -1}) {
 		return
 	}
 
@@ -71,16 +72,16 @@ func TestScope(t *testing.T) {
 
 	scopeChecks := getScopeChecks(scopetestPath, t)
 
-	withTestProcess("scopetest", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("scopetest", t, func(p *proc.Target, fixture protest.Fixture) {
 		for i := range scopeChecks {
-			setFileBreakpoint(p, t, fixture, scopeChecks[i].line)
+			setFileBreakpoint(p, t, fixture.Source, scopeChecks[i].line)
 		}
 
 		t.Logf("%d breakpoints set", len(scopeChecks))
 
 		for {
-			if err := proc.Continue(p); err != nil {
-				if _, exited := err.(proc.ProcessExitedError); exited {
+			if err := p.Continue(); err != nil {
+				if _, exited := err.(proc.ErrProcessExited); exited {
 					break
 				}
 				assertNoError(err, t, "Continue()")
@@ -94,16 +95,12 @@ func TestScope(t *testing.T) {
 
 			scope, _ := scopeCheck.checkLocalsAndArgs(p, t)
 
-			var prev *varCheck
 			for i := range scopeCheck.varChecks {
 				vc := &scopeCheck.varChecks[i]
-				if prev != nil && prev.name != vc.name {
-					prev.checkInScope(scopeCheck.line, scope, t)
+				if vc.shdw {
+					continue
 				}
-				prev = vc
-			}
-			if prev != nil {
-				prev.checkInScope(scopeCheck.line, scope, t)
+				vc.checkInScope(scopeCheck.line, scope, t)
 			}
 
 			scopeCheck.ok = true
@@ -130,6 +127,7 @@ type varCheck struct {
 	name     string
 	typ      string
 	kind     reflect.Kind
+	shdw     bool // this variable should be shadowed
 	hasVal   bool
 	intVal   int64
 	uintVal  uint64
@@ -229,12 +227,17 @@ func (check *scopeCheck) Parse(descr string, t *testing.T) {
 			if err != nil {
 				t.Fatalf("could not parse scope comment %q: %v", descr, err)
 			}
+		}
+	}
 
+	for i := 1; i < len(check.varChecks); i++ {
+		if check.varChecks[i-1].name == check.varChecks[i].name {
+			check.varChecks[i-1].shdw = true
 		}
 	}
 }
 
-func (scopeCheck *scopeCheck) checkLocalsAndArgs(p proc.Process, t *testing.T) (*proc.EvalScope, bool) {
+func (scopeCheck *scopeCheck) checkLocalsAndArgs(p *proc.Target, t *testing.T) (*proc.EvalScope, bool) {
 	scope, err := proc.GoroutineScope(p.CurrentThread())
 	assertNoError(err, t, "GoroutineScope()")
 
@@ -293,6 +296,10 @@ func (varCheck *varCheck) check(line int, v *proc.Variable, t *testing.T, ctxt s
 	typ = strings.Replace(typ, " ", "", -1)
 	if typ != varCheck.typ {
 		t.Errorf("%d: wrong type for %s (%s), got %s, expected %s", line, v.Name, ctxt, typ, varCheck.typ)
+	}
+
+	if varCheck.shdw && v.Flags&proc.VariableShadowed == 0 {
+		t.Errorf("%d: expected shadowed %s variable", line, v.Name)
 	}
 
 	if !varCheck.hasVal {

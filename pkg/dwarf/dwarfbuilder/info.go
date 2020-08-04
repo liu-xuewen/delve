@@ -5,7 +5,8 @@ import (
 	"debug/dwarf"
 	"encoding/binary"
 
-	"github.com/derekparker/delve/pkg/dwarf/util"
+	"github.com/go-delve/delve/pkg/dwarf/godwarf"
+	"github.com/go-delve/delve/pkg/dwarf/util"
 )
 
 // Form represents a DWARF form kind (see Figure 20, page 160 and following,
@@ -91,7 +92,9 @@ func (b *Builder) TagOpen(tag dwarf.Tag, name string) dwarf.Offset {
 	ts.tag = tag
 	b.info.WriteByte(0)
 	b.tagStack = append(b.tagStack, ts)
-	b.Attr(dwarf.AttrName, name)
+	if name != "" {
+		b.Attr(dwarf.AttrName, name)
+	}
 
 	return ts.off
 }
@@ -141,6 +144,9 @@ func (b *Builder) Attr(attr dwarf.Attr, val interface{}) {
 		binary.Write(&b.info, binary.LittleEndian, x)
 	case uint16:
 		tag.form = append(tag.form, DW_FORM_data2)
+		binary.Write(&b.info, binary.LittleEndian, x)
+	case uint64:
+		tag.form = append(tag.form, DW_FORM_data8)
 		binary.Write(&b.info, binary.LittleEndian, x)
 	case Address:
 		tag.form = append(tag.form, DW_FORM_addr)
@@ -231,6 +237,12 @@ func (b *Builder) makeAbbrevTable() []byte {
 	return abbrev.Bytes()
 }
 
+func (b *Builder) AddCompileUnit(name string, lowPC uint64) dwarf.Offset {
+	r := b.TagOpen(dwarf.TagCompileUnit, name)
+	b.Attr(dwarf.AttrLowpc, lowPC)
+	return r
+}
+
 // AddSubprogram adds a subprogram declaration to debug_info, must call
 // TagClose after adding all local variables and parameters.
 // Will write an abbrev corresponding to a DW_TAG_subprogram, followed by a
@@ -279,6 +291,15 @@ func (b *Builder) AddMember(fieldname string, typ dwarf.Offset, memberLoc []byte
 	r := b.TagOpen(dwarf.TagMember, fieldname)
 	b.Attr(dwarf.AttrType, typ)
 	b.Attr(dwarf.AttrDataMemberLoc, memberLoc)
+	b.TagClose()
+	return r
+}
+
+// AddPointerType adds a new pointer type to debug_info.
+func (b *Builder) AddPointerType(typename string, typ dwarf.Offset) dwarf.Offset {
+	r := b.TagOpen(dwarf.TagPointerType, typename)
+	b.Attr(dwarf.AttrType, typ)
+	b.Attr(godwarf.AttrGoKind, uint8(22))
 	b.TagClose()
 	return r
 }

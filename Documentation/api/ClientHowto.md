@@ -27,21 +27,23 @@ Command line arguments that should be handed to the inferior process should be s
 dlv exec --headless ./somebinary -- these arguments are for the inferior process
 ```
 
-Specifying a static port number, like in the [README](//github.com/derekparker/Delve/tree/master/Documentation/README.md) example, can be done using `--listen=127.0.0.1:portnumber`. 
+Specifying a static port number, like in the [README](//github.com/go-delve/Delve/tree/master/Documentation/README.md) example, can be done using `--listen=127.0.0.1:portnumber`. 
 
 This will, however, cause problems if you actually spawn multiple instances of the debugger. 
 
 It's probably better to let Delve pick a random unused port number on its own. To do this do not specify any `--listen` option and read one line of output from dlv's stdout. If the first line emitted by dlv starts with "API server listening at: " then dlv started correctly and the rest of the line specifies the address that Delve is listening at.
 
+The `--log-to-file` and `--log-to-fd` options can be used to redirect the "API server listening at:" message to a file or to a file descriptor. If neither is specified the message will be output to stdout.
+
 ## Controlling the backend
 
 Once you have a running headless instance you can connect to it and start sending commands. Delve's protocol is built on top of the [JSON-RPC](http://json-rpc.org) specification.
 
-The methods of a `service/rpc2.RPCServer` are exposed through this connection, to find out which requests you can send see the documentation of RPCServer on [godoc](https://godoc.org/github.com/derekparker/Delve/service/rpc2#RPCServer). 
+The methods of a `service/rpc2.RPCServer` are exposed through this connection, to find out which requests you can send see the documentation of RPCServer on [godoc](https://godoc.org/github.com/go-delve/Delve/service/rpc2#RPCServer). 
 
 ### Example
 
-Let's say you are trying to create a breakpoint. By looking at [godoc](https://godoc.org/github.com/derekparker/Delve/service/rpc2#RPCServer) you'll find that there is a `CreateBreakpoint` method in `RPCServer`.
+Let's say you are trying to create a breakpoint. By looking at [godoc](https://godoc.org/github.com/go-delve/Delve/service/rpc2#RPCServer) you'll find that there is a `CreateBreakpoint` method in `RPCServer`.
 
 This method, like all other methods of RPCServer that you can call through the API, has two arguments: `args` and `out`: `args` contains all the input arguments of `CreateBreakpoint`, while `out` is what `CreateBreakpoint` will return to you.
 
@@ -62,6 +64,17 @@ Delve will respond by sending a response packet that will look like this:
 ```
 {"id":27, "result": {"Breakpoint": {"id":3, "name":"", "addr":4538829, "file":"/User/you/some/file.go", "line":16, "functionName":"main.main", "Cond":"", "continue":false, "goroutine":false, "stacktrace":0, "LoadArgs":null, "LoadLocals":null, "hitCount":{}, "totalHitCount":0}}, "error":null}
 ```
+
+## Selecting the API version
+
+Delve currently supports two version of its API, APIv1 and APIv2. By default
+a headless instance of `dlv` will serve APIv1 for backward-compatibility
+with older clients, however new clients should use APIv2 as new features
+will only be made available through version 2. The preferred method of
+switching to APIv2 is to send the `RPCServer.SetApiVersion` command right
+after connecting to the backend.
+Alternatively the `--api-version=2` command line option can be used when
+spawning the backend.
 
 ## Diagnostics
 
@@ -175,10 +188,9 @@ as valid.
 
 If you want to let your users specify a breakpoint on a function selected
 from a list of all functions you should specify the name of the function in
-the FunctionName field of Breakpoint and set Line to -1. *Do not omit Line,
-do not set Line to 0*.
+the FunctionName field of Breakpoint.
 
-If you want to support the [same language as dlv's break and trace commands](//github.com/derekparker/Delve/tree/master/Documentation/cli/locspec.md)
+If you want to support the [same language as dlv's break and trace commands](//github.com/go-delve/Delve/tree/master/Documentation/cli/locspec.md)
  you should call RPCServer.FindLocation and
 then use the returned slice of Location objects to create Breakpoints to
 pass to CreateBreakpoint: just fill each Breakpoint.Addr with the
@@ -200,6 +212,7 @@ the user of this:
 
 * For strings, arrays, slices *and structs* the load is incomplete if: `Variable.Len > len(Variable.Children)`. This can happen to structs even if LoadConfig.MaxStructFields is -1 when MaxVariableRecurse is reached.
 * For maps the load is incomplete if: `Variable.Len > len(Variable.Children) / 2`
+* For interfaces the load is incomplete if the only children has the onlyAddr attribute set to true.
 
 ### Loading more of a Variable
 
@@ -231,7 +244,7 @@ are interested in the topmost stack frame of the current goroutine (or
 thread) use: `EvalScope{ GoroutineID: -1, Frame: 0 }`.
 
 More information on the expression language interpreted by RPCServer.Eval
-can be found [here](//github.com/derekparker/Delve/tree/master/Documentation/cli/expr.md).
+can be found [here](//github.com/go-delve/Delve/tree/master/Documentation/cli/expr.md).
 
 ### Variable shadowing
 
@@ -256,6 +269,12 @@ the variable in question is shadowed.
 
 Users of your client should be able to distinguish between shadowed and
 non-shadowed variables.
+
+## Gracefully ending the debug session
+
+To ensure that Delve cleans up after itself by deleting the `debug` or `debug.test` binary it creates 
+and killing any processes spawned by the program being debugged, the `Detach` command needs to be called.
+In case you are disconnecting a running program, ensure to halt the program before trying to detach.
 
 ## Testing the Client
 

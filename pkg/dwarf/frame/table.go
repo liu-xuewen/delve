@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	"github.com/derekparker/delve/pkg/dwarf/util"
+	"github.com/go-delve/delve/pkg/dwarf/util"
 )
 
 type DWRule struct {
@@ -127,7 +127,7 @@ func executeCIEInstructions(cie *CommonInformationEntry) *FrameContext {
 		buf:           bytes.NewBuffer(initialInstructions),
 	}
 
-	frame.ExecuteDwarfProgram()
+	frame.executeDwarfProgram()
 	return frame
 }
 
@@ -142,7 +142,7 @@ func executeDwarfProgramUntilPC(fde *FrameDescriptionEntry, pc uint64) *FrameCon
 	return frame
 }
 
-func (frame *FrameContext) ExecuteDwarfProgram() {
+func (frame *FrameContext) executeDwarfProgram() {
 	for frame.buf.Len() > 0 {
 		executeDwarfInstruction(frame)
 	}
@@ -277,7 +277,7 @@ func setloc(frame *FrameContext) {
 	var loc uint64
 	binary.Read(frame.buf, frame.order, &loc)
 
-	frame.loc = loc
+	frame.loc = loc + frame.cie.staticBase
 }
 
 func offsetextended(frame *FrameContext) {

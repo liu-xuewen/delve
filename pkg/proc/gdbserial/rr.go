@@ -8,20 +8,27 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"unicode"
+
+	"github.com/go-delve/delve/pkg/proc"
 )
 
-// Record uses rr to record the execution of the specified program and
-// returns the trace directory's path.
-func Record(cmd []string, wd string, quiet bool) (tracedir string, err error) {
-	if _, err := exec.LookPath("rr"); err != nil {
-		return "", &ErrBackendUnavailable{}
+// RecordAsync configures rr to record the execution of the specified
+// program. Returns a run function which will actually record the program, a
+// stop function which will prematurely terminate the recording of the
+// program.
+func RecordAsync(cmd []string, wd string, quiet bool) (run func() (string, error), stop func() error, err error) {
+	if err := checkRRAvailabe(); err != nil {
+		return nil, nil, err
 	}
 
 	rfd, wfd, err := os.Pipe()
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
 
 	args := make([]string, 0, len(cmd)+2)
@@ -36,25 +43,43 @@ func Record(cmd []string, wd string, quiet bool) (tracedir string, err error) {
 	rrcmd.ExtraFiles = []*os.File{wfd}
 	rrcmd.Dir = wd
 
-	done := make(chan struct{})
+	tracedirChan := make(chan string)
 	go func() {
 		bs, _ := ioutil.ReadAll(rfd)
-		tracedir = strings.TrimSpace(string(bs))
-		close(done)
+		tracedirChan <- strings.TrimSpace(string(bs))
 	}()
 
-	err = rrcmd.Run()
+	run = func() (string, error) {
+		err := rrcmd.Run()
+		_ = wfd.Close()
+		tracedir := <-tracedirChan
+		return tracedir, err
+	}
+
+	stop = func() error {
+		return rrcmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	return run, stop, nil
+}
+
+// Record uses rr to record the execution of the specified program and
+// returns the trace directory's path.
+func Record(cmd []string, wd string, quiet bool) (tracedir string, err error) {
+	run, _, err := RecordAsync(cmd, wd, quiet)
+	if err != nil {
+		return "", err
+	}
+
 	// ignore run errors, it could be the program crashing
-	wfd.Close()
-	<-done
-	return
+	return run()
 }
 
 // Replay starts an instance of rr in replay mode, with the specified trace
 // directory, and connects to it.
-func Replay(tracedir string, quiet bool) (*Process, error) {
-	if _, err := exec.LookPath("rr"); err != nil {
-		return nil, &ErrBackendUnavailable{}
+func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string) (*proc.Target, error) {
+	if err := checkRRAvailabe(); err != nil {
+		return nil, err
 	}
 
 	rrcmd := exec.Command("rr", "replay", "--dbgport=0", tracedir)
@@ -63,7 +88,7 @@ func Replay(tracedir string, quiet bool) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	rrcmd.SysProcAttr = backgroundSysProcAttr()
+	rrcmd.SysProcAttr = sysProcAttr(false)
 
 	initch := make(chan rrInit)
 	go rrStderrParser(stderr, initch, quiet)
@@ -79,15 +104,47 @@ func Replay(tracedir string, quiet bool) (*Process, error) {
 		return nil, init.err
 	}
 
-	p := New(rrcmd.Process)
+	p := newProcess(rrcmd.Process)
 	p.tracedir = tracedir
-	err = p.Dial(init.port, init.exe, 0)
+	if deleteOnDetach {
+		p.onDetach = func() {
+			safeRemoveAll(p.tracedir)
+		}
+	}
+	tgt, err := p.Dial(init.port, init.exe, 0, debugInfoDirs, proc.StopLaunched)
 	if err != nil {
 		rrcmd.Process.Kill()
 		return nil, err
 	}
 
-	return p, nil
+	return tgt, nil
+}
+
+// ErrPerfEventParanoid is the error returned by Reply and Record if
+// /proc/sys/kernel/perf_event_paranoid is greater than 1.
+type ErrPerfEventParanoid struct {
+	actual int
+}
+
+func (err ErrPerfEventParanoid) Error() string {
+	return fmt.Sprintf("rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but it is %d", err.actual)
+}
+
+func checkRRAvailabe() error {
+	if _, err := exec.LookPath("rr"); err != nil {
+		return &ErrBackendUnavailable{}
+	}
+
+	// Check that /proc/sys/kernel/perf_event_paranoid doesn't exist or is <= 1.
+	buf, err := ioutil.ReadFile("/proc/sys/kernel/perf_event_paranoid")
+	if err == nil {
+		perfEventParanoid, _ := strconv.Atoi(strings.TrimSpace(string(buf)))
+		if perfEventParanoid > 1 {
+			return ErrPerfEventParanoid{perfEventParanoid}
+		}
+	}
+
+	return nil
 }
 
 type rrInit struct {
@@ -229,11 +286,36 @@ func splitQuotedFields(in string) []string {
 }
 
 // RecordAndReplay acts like calling Record and then Replay.
-func RecordAndReplay(cmd []string, wd string, quiet bool) (p *Process, tracedir string, err error) {
-	tracedir, err = Record(cmd, wd, quiet)
+func RecordAndReplay(cmd []string, wd string, quiet bool, debugInfoDirs []string) (*proc.Target, string, error) {
+	tracedir, err := Record(cmd, wd, quiet)
 	if tracedir == "" {
 		return nil, "", err
 	}
-	p, err = Replay(tracedir, quiet)
-	return p, tracedir, err
+	t, err := Replay(tracedir, quiet, true, debugInfoDirs)
+	return t, tracedir, err
+}
+
+// safeRemoveAll removes dir and its contents but only as long as dir does
+// not contain directories.
+func safeRemoveAll(dir string) {
+	dh, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer dh.Close()
+	fis, err := dh.Readdir(-1)
+	if err != nil {
+		return
+	}
+	for _, fi := range fis {
+		if fi.IsDir() {
+			return
+		}
+	}
+	for _, fi := range fis {
+		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
+			return
+		}
+	}
+	os.Remove(dir)
 }

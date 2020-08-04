@@ -1,7 +1,6 @@
 package proc
 
 import (
-	"debug/dwarf"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -9,7 +8,19 @@ import (
 	"reflect"
 )
 
-// Breakpoint represents a breakpoint. Stores information on the break
+const (
+	// UnrecoveredPanic is the name given to the unrecovered panic breakpoint.
+	UnrecoveredPanic = "unrecovered-panic"
+
+	// FatalThrow is the name given to the breakpoint triggered when the target
+	// process dies because of a fatal runtime error.
+	FatalThrow = "runtime-fatal-throw"
+
+	unrecoveredPanicID = -1
+	fatalThrowID       = -2
+)
+
+// Breakpoint represents a physical breakpoint. Stores information on the break
 // point including the byte of data that originally was stored at that
 // address.
 type Breakpoint struct {
@@ -21,7 +32,7 @@ type Breakpoint struct {
 	Addr         uint64 // Address breakpoint is set for.
 	OriginalData []byte // If software breakpoint, the data we replace with breakpoint instruction.
 	Name         string // User defined name of the breakpoint
-	ID           int    // Monotonically increasing ID.
+	LogicalID    int    // ID of the logical breakpoint that owns this physical breakpoint
 
 	// Kind describes whether this is an internal breakpoint (for next'ing or
 	// stepping).
@@ -31,7 +42,8 @@ type Breakpoint struct {
 	Kind BreakpointKind
 
 	// Breakpoint information
-	Tracepoint    bool     // Tracepoint flag
+	Tracepoint    bool // Tracepoint flag
+	TraceReturn   bool
 	Goroutine     bool     // Retrieve goroutine information
 	Stacktrace    int      // Number of stack frames to retrieve
 	Variables     []string // Variables to evaluate
@@ -46,7 +58,7 @@ type Breakpoint struct {
 	// Next uses NextDeferBreakpoints for the breakpoint it sets on the
 	// deferred function, DeferReturns is populated with the
 	// addresses of calls to runtime.deferreturn in the current
-	// function. This insures that the breakpoint on the deferred
+	// function. This ensures that the breakpoint on the deferred
 	// function only triggers on panic or on the defer call to
 	// the function, not when the function is called directly
 	DeferReturns []uint64
@@ -60,7 +72,7 @@ type Breakpoint struct {
 	returnInfo *returnBreakpointInfo
 }
 
-// Breakpoint Kind determines the behavior of delve when the
+// BreakpointKind determines the behavior of delve when the
 // breakpoint is reached.
 type BreakpointKind uint16
 
@@ -82,7 +94,7 @@ const (
 )
 
 func (bp *Breakpoint) String() string {
-	return fmt.Sprintf("Breakpoint %d at %#v %s:%d (%d)", bp.ID, bp.Addr, bp.File, bp.Line, bp.TotalHitCount)
+	return fmt.Sprintf("Breakpoint %d at %#v %s:%d (%d)", bp.LogicalID, bp.Addr, bp.File, bp.Line, bp.TotalHitCount)
 }
 
 // BreakpointExistsError is returned when trying to set a breakpoint at
@@ -119,27 +131,21 @@ func (bp *Breakpoint) CheckCondition(thread Thread) BreakpointState {
 	bpstate := BreakpointState{Breakpoint: bp, Active: false, Internal: false, CondError: nil}
 	if bp.Cond == nil && bp.internalCond == nil {
 		bpstate.Active = true
-		bpstate.Internal = bp.Kind != UserBreakpoint
+		bpstate.Internal = bp.IsInternal()
 		return bpstate
 	}
 	nextDeferOk := true
 	if bp.Kind&NextDeferBreakpoint != 0 {
+		var err error
 		frames, err := ThreadStacktrace(thread, 2)
 		if err == nil {
-			ispanic := len(frames) >= 3 && frames[2].Current.Fn != nil && frames[2].Current.Fn.Name == "runtime.gopanic"
-			isdeferreturn := false
-			if len(frames) >= 1 {
-				for _, pc := range bp.DeferReturns {
-					if frames[0].Ret == pc {
-						isdeferreturn = true
-						break
-					}
-				}
+			nextDeferOk = isPanicCall(frames)
+			if !nextDeferOk {
+				nextDeferOk, _ = isDeferReturnCall(frames, bp.DeferReturns)
 			}
-			nextDeferOk = ispanic || isdeferreturn
 		}
 	}
-	if bp.Kind != UserBreakpoint {
+	if bp.IsInternal() {
 		// Check internalCondition if this is also an internal breakpoint
 		bpstate.Active, bpstate.CondError = evalBreakpointCondition(thread, bp.internalCond)
 		bpstate.Active = bpstate.Active && nextDeferOk
@@ -148,11 +154,26 @@ func (bp *Breakpoint) CheckCondition(thread Thread) BreakpointState {
 			return bpstate
 		}
 	}
-	if bp.Kind&UserBreakpoint != 0 {
+	if bp.IsUser() {
 		// Check normal condition if this is also a user breakpoint
 		bpstate.Active, bpstate.CondError = evalBreakpointCondition(thread, bp.Cond)
 	}
 	return bpstate
+}
+
+func isPanicCall(frames []Stackframe) bool {
+	return len(frames) >= 3 && frames[2].Current.Fn != nil && frames[2].Current.Fn.Name == "runtime.gopanic"
+}
+
+func isDeferReturnCall(frames []Stackframe, deferReturns []uint64) (bool, uint64) {
+	if len(frames) >= 1 {
+		for _, pc := range deferReturns {
+			if frames[0].Ret == pc {
+				return true, pc
+			}
+		}
+	}
+	return false, 0
 }
 
 // IsInternal returns true if bp is an internal breakpoint.
@@ -181,11 +202,12 @@ func evalBreakpointCondition(thread Thread, cond ast.Expr) (bool, error) {
 	if err != nil {
 		return true, fmt.Errorf("error evaluating expression: %v", err)
 	}
-	if v.Unreadable != nil {
-		return true, fmt.Errorf("condition expression unreadable: %v", v.Unreadable)
-	}
 	if v.Kind != reflect.Bool {
 		return true, errors.New("condition expression not boolean")
+	}
+	v.loadValue(loadFullValue)
+	if v.Unreadable != nil {
+		return true, fmt.Errorf("condition expression unreadable: %v", v.Unreadable)
 	}
 	return constant.BoolVal(v.Value), nil
 }
@@ -215,23 +237,18 @@ func NewBreakpointMap() BreakpointMap {
 	}
 }
 
-// ResetBreakpointIDCounter resets the breakpoint ID counter of bpmap.
-func (bpmap *BreakpointMap) ResetBreakpointIDCounter() {
-	bpmap.breakpointIDCounter = 0
-}
-
-type writeBreakpointFn func(addr uint64) (file string, line int, fn *Function, originalData []byte, err error)
-type clearBreakpointFn func(*Breakpoint) error
-
-// Set creates a breakpoint at addr calling writeBreakpoint. Do not call this
-// function, call proc.Process.SetBreakpoint instead, this function exists
-// to implement proc.Process.SetBreakpoint.
-func (bpmap *BreakpointMap) Set(addr uint64, kind BreakpointKind, cond ast.Expr, writeBreakpoint writeBreakpointFn) (*Breakpoint, error) {
+// SetBreakpoint sets a breakpoint at addr, and stores it in the process wide
+// break point table.
+func (t *Target) SetBreakpoint(addr uint64, kind BreakpointKind, cond ast.Expr) (*Breakpoint, error) {
+	if valid, err := t.Valid(); !valid {
+		return nil, err
+	}
+	bpmap := t.Breakpoints()
 	if bp, ok := bpmap.M[addr]; ok {
 		// We can overlap one internal breakpoint with one user breakpoint, we
 		// need to support this otherwise a conditional breakpoint can mask a
 		// breakpoint set by next or step.
-		if (kind != UserBreakpoint && bp.Kind != UserBreakpoint) || (kind == UserBreakpoint && bp.Kind&UserBreakpoint != 0) {
+		if (kind != UserBreakpoint && bp.Kind != UserBreakpoint) || (kind == UserBreakpoint && bp.IsUser()) {
 			return bp, BreakpointExistsError{bp.File, bp.Line, bp.Addr}
 		}
 		bp.Kind |= kind
@@ -243,13 +260,18 @@ func (bpmap *BreakpointMap) Set(addr uint64, kind BreakpointKind, cond ast.Expr,
 		return bp, nil
 	}
 
-	f, l, fn, originalData, err := writeBreakpoint(addr)
+	f, l, fn, originalData, err := t.proc.WriteBreakpoint(addr)
 	if err != nil {
 		return nil, err
 	}
 
+	fnName := ""
+	if fn != nil {
+		fnName = fn.Name
+	}
+
 	newBreakpoint := &Breakpoint{
-		FunctionName: fn.Name,
+		FunctionName: fnName,
 		File:         f,
 		Line:         l,
 		Addr:         addr,
@@ -260,11 +282,11 @@ func (bpmap *BreakpointMap) Set(addr uint64, kind BreakpointKind, cond ast.Expr,
 
 	if kind != UserBreakpoint {
 		bpmap.internalBreakpointIDCounter++
-		newBreakpoint.ID = bpmap.internalBreakpointIDCounter
+		newBreakpoint.LogicalID = bpmap.internalBreakpointIDCounter
 		newBreakpoint.internalCond = cond
 	} else {
 		bpmap.breakpointIDCounter++
-		newBreakpoint.ID = bpmap.breakpointIDCounter
+		newBreakpoint.LogicalID = bpmap.breakpointIDCounter
 		newBreakpoint.Cond = cond
 	}
 
@@ -273,19 +295,23 @@ func (bpmap *BreakpointMap) Set(addr uint64, kind BreakpointKind, cond ast.Expr,
 	return newBreakpoint, nil
 }
 
-// SetWithID creates a breakpoint at addr, with the specified ID.
-func (bpmap *BreakpointMap) SetWithID(id int, addr uint64, writeBreakpoint writeBreakpointFn) (*Breakpoint, error) {
-	bp, err := bpmap.Set(addr, UserBreakpoint, nil, writeBreakpoint)
+// setBreakpointWithID creates a breakpoint at addr, with the specified logical ID.
+func (t *Target) setBreakpointWithID(id int, addr uint64) (*Breakpoint, error) {
+	bpmap := t.Breakpoints()
+	bp, err := t.SetBreakpoint(addr, UserBreakpoint, nil)
 	if err == nil {
-		bp.ID = id
+		bp.LogicalID = id
 		bpmap.breakpointIDCounter--
 	}
 	return bp, err
 }
 
-// Clear clears the breakpoint at addr.
-// Do not call this function call proc.Process.ClearBreakpoint instead.
-func (bpmap *BreakpointMap) Clear(addr uint64, clearBreakpoint clearBreakpointFn) (*Breakpoint, error) {
+// ClearBreakpoint clears the breakpoint at addr.
+func (t *Target) ClearBreakpoint(addr uint64) (*Breakpoint, error) {
+	if valid, err := t.Valid(); !valid {
+		return nil, err
+	}
+	bpmap := t.Breakpoints()
 	bp, ok := bpmap.M[addr]
 	if !ok {
 		return nil, NoBreakpointError{Addr: addr}
@@ -297,7 +323,7 @@ func (bpmap *BreakpointMap) Clear(addr uint64, clearBreakpoint clearBreakpointFn
 		return bp, nil
 	}
 
-	if err := clearBreakpoint(bp); err != nil {
+	if err := t.proc.EraseBreakpoint(bp); err != nil {
 		return nil, err
 	}
 
@@ -308,9 +334,9 @@ func (bpmap *BreakpointMap) Clear(addr uint64, clearBreakpoint clearBreakpointFn
 
 // ClearInternalBreakpoints removes all internal breakpoints from the map,
 // calling clearBreakpoint on each one.
-// Do not call this function, call proc.Process.ClearInternalBreakpoints
-// instead, this function is used to implement that.
-func (bpmap *BreakpointMap) ClearInternalBreakpoints(clearBreakpoint clearBreakpointFn) error {
+func (t *Target) ClearInternalBreakpoints() error {
+	bpmap := t.Breakpoints()
+	threads := t.ThreadList()
 	for addr, bp := range bpmap.M {
 		bp.Kind = bp.Kind & UserBreakpoint
 		bp.internalCond = nil
@@ -318,8 +344,13 @@ func (bpmap *BreakpointMap) ClearInternalBreakpoints(clearBreakpoint clearBreakp
 		if bp.Kind != 0 {
 			continue
 		}
-		if err := clearBreakpoint(bp); err != nil {
+		if err := t.proc.EraseBreakpoint(bp); err != nil {
 			return err
+		}
+		for _, thread := range threads {
+			if thread.Breakpoint().Breakpoint == bp {
+				thread.Breakpoint().Clear()
+			}
 		}
 		delete(bpmap.M, addr)
 	}
@@ -330,7 +361,7 @@ func (bpmap *BreakpointMap) ClearInternalBreakpoints(clearBreakpoint clearBreakp
 // breakpoint set.
 func (bpmap *BreakpointMap) HasInternalBreakpoints() bool {
 	for _, bp := range bpmap.M {
-		if bp.Kind != UserBreakpoint {
+		if bp.IsInternal() {
 			return true
 		}
 	}
@@ -350,6 +381,7 @@ type BreakpointState struct {
 	CondError error
 }
 
+// Clear zeros the struct.
 func (bpstate *BreakpointState) Clear() {
 	bpstate.Breakpoint = nil
 	bpstate.Active = false
@@ -385,8 +417,6 @@ func (rbpi *returnBreakpointInfo) Collect(thread Thread) []*Variable {
 		return nil
 	}
 
-	bi := thread.BinInfo()
-
 	g, err := GetG(thread)
 	if err != nil {
 		return returnInfoError("could not get g", err, thread)
@@ -407,22 +437,12 @@ func (rbpi *returnBreakpointInfo) Collect(thread Thread) []*Variable {
 		return nil
 	}
 
-	// Alter the eval scope so that it looks like we are at the entry point of
-	// the function we just returned from.
-	// This involves changing the location (PC, function...) as well as
-	// anything related to the stack pointer (SP, CFA, FrameBase).
-	scope.PC = rbpi.fn.Entry
-	scope.Fn = rbpi.fn
-	scope.File, scope.Line, _ = bi.PCToLine(rbpi.fn.Entry)
-	scope.Regs.CFA = rbpi.frameOffset + int64(g.stackhi)
-	scope.Regs.Regs[scope.Regs.SPRegNum].Uint64Val = uint64(rbpi.spOffset + int64(g.stackhi))
-
-	bi.dwarfReader.Seek(rbpi.fn.offset)
-	e, err := bi.dwarfReader.Next()
+	oldFrameOffset := rbpi.frameOffset + int64(g.stack.hi)
+	oldSP := uint64(rbpi.spOffset + int64(g.stack.hi))
+	err = fakeFunctionEntryScope(scope, rbpi.fn, oldFrameOffset, oldSP)
 	if err != nil {
 		return returnInfoError("could not read function entry", err, thread)
 	}
-	scope.Regs.FrameBase, _, _, _ = bi.Location(e, dwarf.AttrFrameBase, scope.PC, scope.Regs)
 
 	vars, err := scope.Locals()
 	if err != nil {
@@ -432,12 +452,6 @@ func (rbpi *returnBreakpointInfo) Collect(thread Thread) []*Variable {
 		return (v.Flags & VariableReturnArgument) != 0
 	})
 
-	// Go saves the return variables in the opposite order that the user
-	// specifies them so here we reverse the slice to make it easier to
-	// understand.
-	for i := 0; i < len(vars)/2; i++ {
-		vars[i], vars[len(vars)-i-1] = vars[len(vars)-i-1], vars[i]
-	}
 	return vars
 }
 

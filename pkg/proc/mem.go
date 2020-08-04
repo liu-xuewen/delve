@@ -2,8 +2,9 @@ package proc
 
 import (
 	"errors"
+	"fmt"
 
-	"github.com/derekparker/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/op"
 )
 
 const cacheEnabled = true
@@ -17,6 +18,9 @@ type MemoryReader interface {
 	ReadMemory(buf []byte, addr uintptr) (n int, err error)
 }
 
+// MemoryReadWriter is an interface for reading or writing to
+// the targets memory. This allows us to read from the actual
+// target memory or possibly a cache.
 type MemoryReadWriter interface {
 	MemoryReader
 	WriteMemory(addr uintptr, data []byte) (written int, err error)
@@ -90,7 +94,7 @@ type compositeMemory struct {
 	data    []byte
 }
 
-func newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []op.Piece) *compositeMemory {
+func newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []op.Piece) (*compositeMemory, error) {
 	cmem := &compositeMemory{realmem: mem, regs: regs, pieces: pieces, data: []byte{}}
 	for _, piece := range pieces {
 		if piece.IsRegister {
@@ -99,6 +103,12 @@ func newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []o
 			if sz == 0 && len(pieces) == 1 {
 				sz = len(reg)
 			}
+			if sz > len(reg) {
+				if regs.FloatLoadError != nil {
+					return nil, fmt.Errorf("could not read %d bytes from register %d (size: %d), also error loading floating point registers: %v", sz, piece.RegNum, len(reg), regs.FloatLoadError)
+				}
+				return nil, fmt.Errorf("could not read %d bytes from register %d (size: %d)", sz, piece.RegNum, len(reg))
+			}
 			cmem.data = append(cmem.data, reg[:sz]...)
 		} else {
 			buf := make([]byte, piece.Size)
@@ -106,7 +116,7 @@ func newCompositeMemory(mem MemoryReadWriter, regs op.DwarfRegisters, pieces []o
 			cmem.data = append(cmem.data, buf...)
 		}
 	}
-	return cmem
+	return cmem, nil
 }
 
 func (mem *compositeMemory) ReadMemory(data []byte, addr uintptr) (int, error) {

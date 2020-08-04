@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strconv"
+	"strings"
+	"text/tabwriter"
 )
 
 const (
@@ -52,7 +55,11 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 		if v.Type == "" || len(v.Children) == 0 {
 			fmt.Fprint(buf, "nil")
 		} else if v.Children[0].OnlyAddr && v.Children[0].Addr != 0 {
-			fmt.Fprintf(buf, "(%s)(0x%x)", v.Type, v.Children[0].Addr)
+			if strings.Contains(v.Type, "/") {
+				fmt.Fprintf(buf, "(%q)(%#x)", v.Type, v.Children[0].Addr)
+			} else {
+				fmt.Fprintf(buf, "(%s)(%#x)", v.Type, v.Children[0].Addr)
+			}
 		} else {
 			fmt.Fprint(buf, "*")
 			v.Children[0].writeTo(buf, false, newlines, includeType, indent)
@@ -61,7 +68,7 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 		if len(v.Children) == 0 {
 			fmt.Fprintf(buf, "unsafe.Pointer(nil)")
 		} else {
-			fmt.Fprintf(buf, "unsafe.Pointer(0x%x)", v.Children[0].Addr)
+			fmt.Fprintf(buf, "unsafe.Pointer(%#x)", v.Children[0].Addr)
 		}
 	case reflect.String:
 		v.writeStringTo(buf)
@@ -107,7 +114,11 @@ func (v *Variable) writeTo(buf io.Writer, top, newlines, includeType bool, inden
 				v.Children[0].writeTo(buf, false, newlines, !includeType, indent)
 			}
 		} else if data.OnlyAddr {
-			fmt.Fprintf(buf, "*(*%q)(0x%x)", v.Type, v.Addr)
+			if strings.Contains(v.Type, "/") {
+				fmt.Fprintf(buf, "*(*%q)(%#x)", v.Type, v.Addr)
+			} else {
+				fmt.Fprintf(buf, "*(*%s)(%#x)", v.Type, v.Addr)
+			}
 		} else {
 			v.Children[0].writeTo(buf, false, newlines, !includeType, indent)
 		}
@@ -158,7 +169,11 @@ func (v *Variable) writeArrayTo(buf io.Writer, newlines, includeType bool, inden
 
 func (v *Variable) writeStructTo(buf io.Writer, newlines, includeType bool, indent string) {
 	if int(v.Len) != len(v.Children) && len(v.Children) == 0 {
-		fmt.Fprintf(buf, "(*%s)(0x%x)", v.Type, v.Addr)
+		if strings.Contains(v.Type, "/") {
+			fmt.Fprintf(buf, "(*%q)(%#x)", v.Type, v.Addr)
+		} else {
+			fmt.Fprintf(buf, "(*%s)(%#x)", v.Type, v.Addr)
+		}
 		return
 	}
 
@@ -340,4 +355,59 @@ func (v *Variable) writeSliceOrArrayTo(buf io.Writer, newlines bool, indent stri
 	}
 
 	fmt.Fprint(buf, "]")
+}
+
+func PrettyExamineMemory(address uintptr, memArea []byte, format byte) string {
+
+	var (
+		cols      int
+		colFormat string
+		addrLen   int
+		addrFmt   string
+	)
+
+	// Diffrent versions of golang output differently about '#'.
+	// See https://ci.appveyor.com/project/derekparker/delve-facy3/builds/30179356.
+	switch format {
+	case 'b':
+		cols = 4 // Avoid emitting rows that are too long when using binary format
+		colFormat = "%08b"
+	case 'o':
+		cols = 8
+		colFormat = "%04o" // Always keep one leading zero for octal.
+	case 'd':
+		cols = 8
+		colFormat = "%03d"
+	case 'x':
+		cols = 8
+		colFormat = "0x%02x" // Always keep one leading '0x' for hex.
+	default:
+		return fmt.Sprintf("not supprted format %q\n", string(format))
+	}
+	colFormat += "\t"
+
+	l := len(memArea)
+	rows := l / cols
+	if l%cols != 0 {
+		rows++
+	}
+
+	// Avoid the lens of two adjacent address are different, so always use the last addr's len to format.
+	if l != 0 {
+		addrLen = len(fmt.Sprintf("%x", uint64(address)+uint64(l)))
+	}
+	addrFmt = "0x%0" + strconv.Itoa(addrLen) + "x:\t"
+
+	var b strings.Builder
+	w := tabwriter.NewWriter(&b, 0, 0, 3, ' ', 0)
+	for i := 0; i < rows; i++ {
+		fmt.Fprintf(w, addrFmt, address)
+		for j := 0; j < cols && i*cols+j < l; j++ {
+			fmt.Fprintf(w, colFormat, memArea[i*cols+j])
+		}
+		fmt.Fprintln(w, "")
+		address += uintptr(cols)
+	}
+	w.Flush()
+	return b.String()
 }

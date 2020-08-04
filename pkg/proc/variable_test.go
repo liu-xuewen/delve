@@ -4,18 +4,17 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/proc"
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/proc"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 func TestGoroutineCreationLocation(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("goroutinestackprog", t, func(p proc.Process, fixture protest.Fixture) {
-		bp, err := setFunctionBreakpoint(p, "main.agoroutine")
-		assertNoError(err, t, "BreakByLocation()")
-		assertNoError(proc.Continue(p), t, "Continue()")
+	withTestProcess("goroutinestackprog", t, func(p *proc.Target, fixture protest.Fixture) {
+		bp := setFunctionBreakpoint(p, t, "main.agoroutine")
+		assertNoError(p.Continue(), t, "Continue()")
 
-		gs, err := proc.GoroutinesInfo(p)
+		gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 		assertNoError(err, t, "GoroutinesInfo")
 
 		for _, g := range gs {
@@ -40,6 +39,6 @@ func TestGoroutineCreationLocation(t *testing.T) {
 		}
 
 		p.ClearBreakpoint(bp.Addr)
-		proc.Continue(p)
+		p.Continue()
 	})
 }

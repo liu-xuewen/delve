@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"go/constant"
 	"io/ioutil"
@@ -14,12 +15,20 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/goversion"
-	"github.com/derekparker/delve/pkg/proc"
-	"github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/test"
 )
 
+var buildMode string
+
 func TestMain(m *testing.M) {
+	flag.StringVar(&buildMode, "test-buildmode", "", "selects build mode")
+	flag.Parse()
+	if buildMode != "" && buildMode != "pie" {
+		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
+		os.Exit(1)
+	}
 	os.Exit(test.RunTestsWithFixtures(m))
 }
 
@@ -125,10 +134,10 @@ func TestSplicedReader(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mem := &SplicedMemory{}
+			mem := &splicedMemory{}
 			for _, region := range test.regions {
 				r := bytes.NewReader(region.data)
-				mem.Add(&OffsetReaderAt{r, 0}, region.off, region.length)
+				mem.Add(&offsetReaderAt{r, 0}, region.off, region.length)
 			}
 			got := make([]byte, test.readLen)
 			n, err := mem.ReadMemory(got, test.readAddr)
@@ -139,14 +148,19 @@ func TestSplicedReader(t *testing.T) {
 	}
 }
 
-func withCoreFile(t *testing.T, name, args string) *Process {
+func withCoreFile(t *testing.T, name, args string) *proc.Target {
 	// This is all very fragile and won't work on hosts with non-default core patterns.
 	// Might be better to check in the binary and core?
 	tempDir, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fix := test.BuildFixture(name, 0)
+	test.PathsToRemove = append(test.PathsToRemove, tempDir)
+	var buildFlags test.BuildFlags
+	if buildMode == "pie" {
+		buildFlags = test.BuildModePIE
+	}
+	fix := test.BuildFixture(name, buildFlags)
 	bashCmd := fmt.Sprintf("cd %v && ulimit -c unlimited && GOTRACEBACK=crash %v %s", tempDir, fix.Path, args)
 	exec.Command("bash", "-c", bashCmd).Run()
 	cores, err := filepath.Glob(path.Join(tempDir, "core*"))
@@ -159,15 +173,29 @@ func withCoreFile(t *testing.T, name, args string) *Process {
 	}
 	corePath := cores[0]
 
-	p, err := OpenCore(corePath, fix.Path)
+	p, err := OpenCore(corePath, fix.Path, []string{})
 	if err != nil {
+		t.Errorf("OpenCore(%q) failed: %v", corePath, err)
 		pat, err := ioutil.ReadFile("/proc/sys/kernel/core_pattern")
 		t.Errorf("read core_pattern: %q, %v", pat, err)
 		apport, err := ioutil.ReadFile("/var/log/apport.log")
 		t.Errorf("read apport log: %q, %v", apport, err)
-		t.Fatalf("ReadCore() failed: %v", err)
+		t.Fatalf("previous errors")
 	}
 	return p
+}
+
+func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
+	dregs := arch.RegistersToDwarfRegisters(0, regs)
+	dregs.Reg(^uint64(0))
+	for i := 0; i < dregs.CurrentSize(); i++ {
+		reg := dregs.Reg(uint64(i))
+		if reg == nil {
+			continue
+		}
+		name, _, value := arch.DwarfRegisterToString(i, reg)
+		t.Logf("%s = %s", name, value)
+	}
 }
 
 func TestCore(t *testing.T) {
@@ -176,7 +204,7 @@ func TestCore(t *testing.T) {
 	}
 	p := withCoreFile(t, "panic", "")
 
-	gs, err := proc.GoroutinesInfo(p)
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 	if err != nil || len(gs) == 0 {
 		t.Fatalf("GoroutinesInfo() = %v, %v; wanted at least one goroutine", gs, err)
 	}
@@ -185,7 +213,7 @@ func TestCore(t *testing.T) {
 	var panickingStack []proc.Stackframe
 	for _, g := range gs {
 		t.Logf("Goroutine %d", g.ID)
-		stack, err := g.Stacktrace(10)
+		stack, err := g.Stacktrace(10, 0)
 		if err != nil {
 			t.Errorf("Stacktrace() on goroutine %v = %v", g, err)
 		}
@@ -209,7 +237,7 @@ func TestCore(t *testing.T) {
 	// Walk backward, because the current function seems to be main.main
 	// in the actual call to panic().
 	for i := len(panickingStack) - 1; i >= 0; i-- {
-		if panickingStack[i].Current.Fn.Name == "main.main" {
+		if panickingStack[i].Current.Fn != nil && panickingStack[i].Current.Fn.Name == "main.main" {
 			mainFrame = &panickingStack[i]
 		}
 	}
@@ -224,14 +252,11 @@ func TestCore(t *testing.T) {
 		t.Errorf("main.msg = %q, want %q", msg.Value, "BOOM!")
 	}
 
-	regs, err := p.CurrentThread().Registers(true)
+	regs, err := p.CurrentThread().Registers()
 	if err != nil {
 		t.Fatalf("Couldn't get current thread registers: %v", err)
 	}
-	regslice := regs.Slice()
-	for _, reg := range regslice {
-		t.Logf("%s = %s", reg.Name, reg.Value)
-	}
+	logRegisters(t, regs, p.BinInfo().Arch)
 }
 
 func TestCoreFpRegisters(t *testing.T) {
@@ -240,13 +265,13 @@ func TestCoreFpRegisters(t *testing.T) {
 	}
 	// in go1.10 the crash is executed on a different thread and registers are
 	// no longer available in the core dump.
-	if ver, _ := goversion.Parse(runtime.Version()); ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
+	if ver, _ := goversion.Parse(runtime.Version()); ver.Major < 0 || ver.AfterOrEqual(goversion.GoVersion{Major: 1, Minor: 10, Rev: -1}) {
 		t.Skip("not supported in go1.10 and later")
 	}
 
 	p := withCoreFile(t, "fputest/", "panic")
 
-	gs, err := proc.GoroutinesInfo(p)
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 	if err != nil || len(gs) == 0 {
 		t.Fatalf("GoroutinesInfo() = %v, %v; wanted at least one goroutine", gs, err)
 	}
@@ -263,7 +288,7 @@ func TestCoreFpRegisters(t *testing.T) {
 				continue
 			}
 			if frames[i].Current.Fn.Name == "main.main" {
-				regs, err = thread.Registers(true)
+				regs, err = thread.Registers()
 				if err != nil {
 					t.Fatalf("Could not get registers for thread %x, %v", thread.ThreadID(), err)
 				}
@@ -297,17 +322,20 @@ func TestCoreFpRegisters(t *testing.T) {
 		{"XMM8", "0x4059999a404ccccd4059999a404ccccd"},
 	}
 
-	for _, reg := range regs.Slice() {
-		t.Logf("%s = %s", reg.Name, reg.Value)
-	}
+	arch := p.BinInfo().Arch
+	logRegisters(t, regs, arch)
+	dregs := arch.RegistersToDwarfRegisters(0, regs)
 
 	for _, regtest := range regtests {
 		found := false
-		for _, reg := range regs.Slice() {
-			if reg.Name == regtest.name {
+		dregs.Reg(^uint64(0))
+		for i := 0; i < dregs.CurrentSize(); i++ {
+			reg := dregs.Reg(uint64(i))
+			regname, _, regval := arch.DwarfRegisterToString(i, reg)
+			if reg != nil && regname == regtest.name {
 				found = true
-				if !strings.HasPrefix(reg.Value, regtest.value) {
-					t.Fatalf("register %s expected %q got %q", reg.Name, regtest.value, reg.Value)
+				if !strings.HasPrefix(regval, regtest.value) {
+					t.Fatalf("register %s expected %q got %q", regname, regtest.value, regval)
 				}
 			}
 		}
@@ -323,13 +351,13 @@ func TestCoreWithEmptyString(t *testing.T) {
 	}
 	p := withCoreFile(t, "coreemptystring", "")
 
-	gs, err := proc.GoroutinesInfo(p)
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
 	assertNoError(err, t, "GoroutinesInfo")
 
 	var mainFrame *proc.Stackframe
 mainSearch:
 	for _, g := range gs {
-		stack, err := g.Stacktrace(10)
+		stack, err := g.Stacktrace(10, 0)
 		assertNoError(err, t, "Stacktrace()")
 		for _, frame := range stack {
 			if frame.Current.Fn != nil && frame.Current.Fn.Name == "main.main" {
@@ -344,12 +372,98 @@ mainSearch:
 	}
 
 	scope := proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, *mainFrame)
-	v1, err := scope.EvalVariable("t", proc.LoadConfig{true, 1, 64, 64, -1})
+	loadConfig := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
+	v1, err := scope.EvalVariable("t", loadConfig)
 	assertNoError(err, t, "EvalVariable(t)")
 	assertNoError(v1.Unreadable, t, "unreadable variable 't'")
 	t.Logf("t = %#v\n", v1)
-	v2, err := scope.EvalVariable("s", proc.LoadConfig{true, 1, 64, 64, -1})
+	v2, err := scope.EvalVariable("s", loadConfig)
 	assertNoError(err, t, "EvalVariable(s)")
 	assertNoError(v2.Unreadable, t, "unreadable variable 's'")
 	t.Logf("s = %#v\n", v2)
+}
+
+func TestMinidump(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("minidumps can only be produced on windows")
+	}
+	var buildFlags test.BuildFlags
+	if buildMode == "pie" {
+		buildFlags = test.BuildModePIE
+	}
+	fix := test.BuildFixture("sleep", buildFlags)
+	mdmpPath := procdump(t, fix.Path)
+
+	p, err := OpenCore(mdmpPath, fix.Path, []string{})
+	if err != nil {
+		t.Fatalf("OpenCore: %v", err)
+	}
+	gs, _, err := proc.GoroutinesInfo(p, 0, 0)
+	if err != nil || len(gs) == 0 {
+		t.Fatalf("GoroutinesInfo() = %v, %v; wanted at least one goroutine", gs, err)
+	}
+	t.Logf("%d goroutines", len(gs))
+	foundMain, foundTime := false, false
+	for _, g := range gs {
+		stack, err := g.Stacktrace(10, 0)
+		if err != nil {
+			t.Errorf("Stacktrace() on goroutine %v = %v", g, err)
+		}
+		t.Logf("goroutine %d", g.ID)
+		for _, frame := range stack {
+			name := "?"
+			if frame.Current.Fn != nil {
+				name = frame.Current.Fn.Name
+			}
+			t.Logf("\t%s:%d in %s %#x", frame.Current.File, frame.Current.Line, name, frame.Current.PC)
+			if frame.Current.Fn == nil {
+				continue
+			}
+			switch frame.Current.Fn.Name {
+			case "main.main":
+				foundMain = true
+			case "time.Sleep":
+				foundTime = true
+			}
+		}
+		if foundMain != foundTime {
+			t.Errorf("found main.main but no time.Sleep (or viceversa) %v %v", foundMain, foundTime)
+		}
+	}
+	if !foundMain {
+		t.Fatalf("could not find main goroutine")
+	}
+}
+
+func procdump(t *testing.T, exePath string) string {
+	exeDir := filepath.Dir(exePath)
+	cmd := exec.Command("procdump64", "-accepteula", "-ma", "-n", "1", "-s", "3", "-x", exeDir, exePath, "quit")
+	out, err := cmd.CombinedOutput() // procdump exits with non-zero status on success, so we have to ignore the error here
+	if !strings.Contains(string(out), "Dump count reached.") {
+		t.Fatalf("possible error running procdump64, output: %q, error: %v", string(out), err)
+	}
+
+	dh, err := os.Open(exeDir)
+	if err != nil {
+		t.Fatalf("could not open executable file directory %q: %v", exeDir, err)
+	}
+	defer dh.Close()
+	fis, err := dh.Readdir(-1)
+	if err != nil {
+		t.Fatalf("could not read executable file directory %q: %v", exeDir, err)
+	}
+	t.Logf("looking for dump file")
+	exeName := filepath.Base(exePath)
+	for _, fi := range fis {
+		name := fi.Name()
+		t.Logf("\t%s", name)
+		if strings.HasPrefix(name, exeName) && strings.HasSuffix(name, ".dmp") {
+			mdmpPath := filepath.Join(exeDir, name)
+			test.PathsToRemove = append(test.PathsToRemove, mdmpPath)
+			return mdmpPath
+		}
+	}
+
+	t.Fatalf("could not find dump file")
+	return ""
 }

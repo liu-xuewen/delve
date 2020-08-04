@@ -8,7 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/derekparker/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/config"
 )
 
 func configureCmd(t *Term, ctx callContext, args string) error {
@@ -20,7 +20,15 @@ func configureCmd(t *Term, ctx callContext, args string) error {
 	case "":
 		return fmt.Errorf("wrong number of arguments to \"config\"")
 	default:
-		return configureSet(t, args)
+		err := configureSet(t, args)
+		if err != nil {
+			return err
+		}
+		if t.client != nil { // only happens in tests
+			lcfg := t.loadConfig()
+			t.client.SetReturnValuesLoadConfig(&lcfg)
+		}
+		return nil
 	}
 }
 
@@ -87,7 +95,7 @@ func configureList(t *Term) error {
 }
 
 func configureSet(t *Term, args string) error {
-	v := strings.SplitN(args, " ", 2)
+	v := split2PartsBySpace(args)
 
 	cfgname := v[0]
 	var rest string
@@ -115,10 +123,15 @@ func configureSet(t *Term, args string) error {
 			if err != nil {
 				return reflect.ValueOf(nil), fmt.Errorf("argument to %q must be a number", cfgname)
 			}
+			if n < 0 {
+				return reflect.ValueOf(nil), fmt.Errorf("argument to %q must be a number greater than zero", cfgname)
+			}
 			return reflect.ValueOf(&n), nil
 		case reflect.Bool:
 			v := rest == "true"
 			return reflect.ValueOf(&v), nil
+		case reflect.String:
+			return reflect.ValueOf(&rest), nil
 		default:
 			return reflect.ValueOf(nil), fmt.Errorf("unsupported type for configuration key %q", cfgname)
 		}
@@ -159,7 +172,7 @@ func configureSetSubstitutePath(t *Term, rest string) error {
 				return nil
 			}
 		}
-		t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{argv[0], argv[1]})
+		t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{From: argv[0], To: argv[1]})
 	default:
 		return fmt.Errorf("too many arguments to \"config substitute-path\"")
 	}

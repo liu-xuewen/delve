@@ -56,6 +56,8 @@ To see more values use the slice operator:
 
 For this purpose delve allows use of the slice operator on maps, `m[64:]` will return the key/value pairs of map `m` that follow the first 64 key/value pairs (note that delve iterates over maps using a fixed ordering).
 
+These limits can be configured with `max-string-len` and `max-array-values`. See [config](https://github.com/go-delve/delve/tree/master/Documentation/cli#config) for usage.
+
 # Interfaces
 
 Interfaces will be printed using the following syntax:
@@ -75,10 +77,24 @@ interface {}(*struct string) *"test"
 error(*struct main.astruct) *{A: 1, B: 2}
 ```
 
-To use a field of a struct contained inside an interface variable use a type assertion:
+To use the contents of an interface variable use a type assertion:
 
 ```
 (dlv) p iface1.(*main.astruct).B
+2
+```
+
+Or just use the special `.(data)` type assertion:
+
+```
+(dlv) p iface1.(data).B
+2
+```
+
+If the contents of the interface variable are a struct or a pointer to struct the fields can also be accessed directly:
+
+```
+(dlv) p iface1.B
 2
 ```
 
@@ -90,3 +106,7 @@ Packages with the same name can be disambiguated by using the full package path.
 (dlv) p "some/package".A
 (dlv) p "some/other/package".A
 ```
+
+# Pointers in Cgo
+
+Char pointers are always treated as NUL terminated strings, both indexing and the slice operator can be applied to them. Other C pointers can also be used similarly to Go slices, with indexing and the slice operator. In both of these cases it is up to the user to respect array bounds.

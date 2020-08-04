@@ -1,16 +1,16 @@
-// +build linux darwin
+// +build linux darwin freebsd
 
 package gdbserial
 
 import (
+	"os/signal"
 	"syscall"
-	"unsafe"
 )
 
-func backgroundSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setpgid: true, Pgid: 0, Foreground: false}
+func sysProcAttr(foreground bool) *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{Setpgid: true, Pgid: 0, Foreground: foreground}
 }
 
-func moveToForeground(pid int) {
-	syscall.Syscall(syscall.SYS_IOCTL, uintptr(0), uintptr(syscall.TIOCSPGRP), uintptr(unsafe.Pointer(&pid)))
+func foregroundSignalsIgnore() {
+	signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
 }

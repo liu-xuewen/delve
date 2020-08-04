@@ -2,14 +2,16 @@ package api
 
 import (
 	"bytes"
+	"fmt"
 	"go/constant"
 	"go/printer"
 	"go/token"
 	"reflect"
 	"strconv"
 
-	"github.com/derekparker/delve/pkg/dwarf/godwarf"
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/dwarf/godwarf"
+	"github.com/go-delve/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
 // ConvertBreakpoint converts from a proc.Breakpoint to
@@ -17,18 +19,20 @@ import (
 func ConvertBreakpoint(bp *proc.Breakpoint) *Breakpoint {
 	b := &Breakpoint{
 		Name:          bp.Name,
-		ID:            bp.ID,
+		ID:            bp.LogicalID,
 		FunctionName:  bp.FunctionName,
 		File:          bp.File,
 		Line:          bp.Line,
 		Addr:          bp.Addr,
 		Tracepoint:    bp.Tracepoint,
+		TraceReturn:   bp.TraceReturn,
 		Stacktrace:    bp.Stacktrace,
 		Goroutine:     bp.Goroutine,
 		Variables:     bp.Variables,
 		LoadArgs:      LoadConfigFromProc(bp.LoadArgs),
 		LoadLocals:    LoadConfigFromProc(bp.LoadLocals),
 		TotalHitCount: bp.TotalHitCount,
+		Addrs:         []uint64{bp.Addr},
 	}
 
 	b.HitCount = map[string]uint64{}
@@ -41,6 +45,28 @@ func ConvertBreakpoint(bp *proc.Breakpoint) *Breakpoint {
 	b.Cond = buf.String()
 
 	return b
+}
+
+// ConvertBreakpoints converts a slice of physical breakpoints into a slice
+// of logical breakpoints.
+// The input must be sorted by increasing LogicalID
+func ConvertBreakpoints(bps []*proc.Breakpoint) []*Breakpoint {
+	if len(bps) <= 0 {
+		return nil
+	}
+	r := make([]*Breakpoint, 0, len(bps))
+	for _, bp := range bps {
+		if len(r) > 0 {
+			if r[len(r)-1].ID == bp.LogicalID {
+				r[len(r)-1].Addrs = append(r[len(r)-1].Addrs, bp.Addr)
+				continue
+			} else if r[len(r)-1].ID > bp.LogicalID {
+				panic("input not sorted")
+			}
+		}
+		r = append(r, ConvertBreakpoint(bp))
+	}
+	return r
 }
 
 // ConvertThread converts a proc.Thread into an
@@ -122,7 +148,7 @@ func ConvertVar(v *proc.Variable) *Variable {
 		Flags:    VariableFlags(v.Flags),
 		Base:     v.Base,
 
-		LocationExpr: v.LocationExpr,
+		LocationExpr: v.LocationExpr.String(),
 		DeclLine:     v.DeclLine,
 	}
 
@@ -142,8 +168,9 @@ func ConvertVar(v *proc.Variable) *Variable {
 		case reflect.String, reflect.Func:
 			r.Value = constant.StringVal(v.Value)
 		default:
-			r.Value = v.ConstDescr()
-			if r.Value == "" {
+			if cd := v.ConstDescr(); cd != "" {
+				r.Value = fmt.Sprintf("%s (%s)", cd, v.Value.String())
+			} else {
 				r.Value = v.Value.String()
 			}
 		}
@@ -215,7 +242,7 @@ func ConvertFunction(fn *proc.Function) *Function {
 	// those fields is not documented their value was replaced with 0 when
 	// gosym.Func was replaced by debug_info entries.
 	return &Function{
-		Name:      fn.Name,
+		Name_:     fn.Name,
 		Type:      0,
 		Value:     fn.Entry,
 		GoType:    0,
@@ -230,12 +257,17 @@ func ConvertGoroutine(g *proc.G) *Goroutine {
 	if th != nil {
 		tid = th.ThreadID()
 	}
+	if g.Unreadable != nil {
+		return &Goroutine{Unreadable: g.Unreadable.Error()}
+	}
 	return &Goroutine{
 		ID:             g.ID,
 		CurrentLoc:     ConvertLocation(g.CurrentLoc),
 		UserCurrentLoc: ConvertLocation(g.UserCurrent()),
 		GoStatementLoc: ConvertLocation(g.Go()),
+		StartLoc:       ConvertLocation(g.StartLoc()),
 		ThreadID:       tid,
+		Labels:         g.Labels(),
 	}
 }
 
@@ -249,6 +281,7 @@ func ConvertLocation(loc proc.Location) Location {
 	}
 }
 
+// ConvertAsmInstruction converts from proc.AsmInstruction to api.AsmInstruction.
 func ConvertAsmInstruction(inst proc.AsmInstruction, text string) AsmInstruction {
 	var destloc *Location
 	if inst.DestLoc != nil {
@@ -265,40 +298,60 @@ func ConvertAsmInstruction(inst proc.AsmInstruction, text string) AsmInstruction
 	}
 }
 
+// LoadConfigToProc converts an api.LoadConfig to proc.LoadConfig.
 func LoadConfigToProc(cfg *LoadConfig) *proc.LoadConfig {
 	if cfg == nil {
 		return nil
 	}
 	return &proc.LoadConfig{
-		cfg.FollowPointers,
-		cfg.MaxVariableRecurse,
-		cfg.MaxStringLen,
-		cfg.MaxArrayValues,
-		cfg.MaxStructFields,
+		FollowPointers:     cfg.FollowPointers,
+		MaxVariableRecurse: cfg.MaxVariableRecurse,
+		MaxStringLen:       cfg.MaxStringLen,
+		MaxArrayValues:     cfg.MaxArrayValues,
+		MaxStructFields:    cfg.MaxStructFields,
+		MaxMapBuckets:      0, // MaxMapBuckets is set internally by pkg/proc, read its documentation for an explanation.
 	}
 }
 
+// LoadConfigFromProc converts a proc.LoadConfig to api.LoadConfig.
 func LoadConfigFromProc(cfg *proc.LoadConfig) *LoadConfig {
 	if cfg == nil {
 		return nil
 	}
 	return &LoadConfig{
-		cfg.FollowPointers,
-		cfg.MaxVariableRecurse,
-		cfg.MaxStringLen,
-		cfg.MaxArrayValues,
-		cfg.MaxStructFields,
+		FollowPointers:     cfg.FollowPointers,
+		MaxVariableRecurse: cfg.MaxVariableRecurse,
+		MaxStringLen:       cfg.MaxStringLen,
+		MaxArrayValues:     cfg.MaxArrayValues,
+		MaxStructFields:    cfg.MaxStructFields,
 	}
 }
 
-func ConvertRegisters(in []proc.Register) (out []Register) {
-	out = make([]Register, len(in))
-	for i := range in {
-		out[i] = Register{in[i].Name, in[i].Value}
+// ConvertRegisters converts proc.Register to api.Register for a slice.
+func ConvertRegisters(in op.DwarfRegisters, arch *proc.Arch, floatingPoint bool) (out []Register) {
+	if floatingPoint {
+		in.Reg(^uint64(0)) // force loading all registers
+	}
+	out = make([]Register, 0, in.CurrentSize())
+	for i := 0; i < in.CurrentSize(); i++ {
+		reg := in.Reg(uint64(i))
+		if reg == nil {
+			continue
+		}
+		name, fp, repr := arch.DwarfRegisterToString(i, reg)
+		if !floatingPoint && fp {
+			continue
+		}
+		out = append(out, Register{name, repr, i})
 	}
 	return
 }
 
+// ConvertCheckpoint converts proc.Chekcpoint to api.Checkpoint.
 func ConvertCheckpoint(in proc.Checkpoint) (out Checkpoint) {
 	return Checkpoint(in)
+}
+
+func ConvertImage(image *proc.Image) Image {
+	return Image{Path: image.Path, Address: image.StaticBase}
 }

@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/derekparker/delve/pkg/logflags"
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/go-delve/delve/pkg/proc"
 	"github.com/sirupsen/logrus"
 )
 
@@ -52,6 +52,7 @@ const (
 	regnamePC     = "rip"
 	regnameCX     = "rcx"
 	regnameSP     = "rsp"
+	regnameDX     = "rdx"
 	regnameBP     = "rbp"
 	regnameFsBase = "fs_base"
 	regnameGsBase = "gs_base"
@@ -226,7 +227,8 @@ type gdbRegisterInfo struct {
 	Name    string `xml:"name,attr"`
 	Bitsize int    `xml:"bitsize,attr"`
 	Offset  int
-	Regnum  int `xml:"regnum,attr"`
+	Regnum  int    `xml:"regnum,attr"`
+	Group   string `xml:"group,attr"`
 }
 
 // readTargetXml reads target.xml file from stub using qXfer:features:read,
@@ -356,7 +358,7 @@ func (conn *gdbConn) readRegisterInfo() (err error) {
 }
 
 func (conn *gdbConn) readAnnex(annex string) ([]gdbRegisterInfo, error) {
-	tgtbuf, err := conn.qXfer("features", annex)
+	tgtbuf, err := conn.qXfer("features", annex, false)
 	if err != nil {
 		return nil, err
 	}
@@ -376,19 +378,28 @@ func (conn *gdbConn) readAnnex(annex string) ([]gdbRegisterInfo, error) {
 }
 
 func (conn *gdbConn) readExecFile() (string, error) {
-	outbuf, err := conn.qXfer("exec-file", "")
+	outbuf, err := conn.qXfer("exec-file", "", true)
 	if err != nil {
 		return "", err
 	}
 	return string(outbuf), nil
 }
 
+func (conn *gdbConn) readAuxv() ([]byte, error) {
+	return conn.qXfer("auxv", "", true)
+}
+
 // qXfer executes a 'qXfer' read with the specified kind (i.e. feature,
 // exec-file, etc...) and annex.
-func (conn *gdbConn) qXfer(kind, annex string) ([]byte, error) {
+func (conn *gdbConn) qXfer(kind, annex string, binary bool) ([]byte, error) {
 	out := []byte{}
 	for {
-		buf, err := conn.exec([]byte(fmt.Sprintf("$qXfer:%s:read:%s:%x,fff", kind, annex, len(out))), "target features transfer")
+		cmd := []byte(fmt.Sprintf("$qXfer:%s:read:%s:%x,fff", kind, annex, len(out)))
+		err := conn.send(cmd)
+		if err != nil {
+			return nil, err
+		}
+		buf, err := conn.recv(cmd, "target features transfer", binary)
 		if err != nil {
 			return nil, err
 		}
@@ -425,7 +436,7 @@ func (conn *gdbConn) kill() error {
 		// kill. This is not an error.
 		conn.conn.Close()
 		conn.conn = nil
-		return proc.ProcessExitedError{Pid: conn.pid}
+		return proc.ErrProcessExited{Pid: conn.pid}
 	}
 	if err != nil {
 		return err
@@ -527,16 +538,23 @@ func (conn *gdbConn) writeRegister(threadID string, regnum int, data []byte) err
 	return err
 }
 
-// resume executes a 'vCont' command on all threads with action 'c' if sig
-// is 0 or 'C' if it isn't.
-func (conn *gdbConn) resume(sig uint8, tu *threadUpdater) (string, uint8, error) {
+// resume execution of the target process.
+// If the current direction is proc.Backward this is done with the 'bc' command.
+// If the current direction is proc.Forward this is done with the vCont command.
+// The threads argument will be used to determine which signal to use to
+// resume each thread. If a thread has sig == 0 the 'c' action will be used,
+// otherwise the 'C' action will be used and the value of sig will be passed
+// to it.
+func (conn *gdbConn) resume(threads map[int]*gdbThread, tu *threadUpdater) (string, uint8, error) {
 	if conn.direction == proc.Forward {
 		conn.outbuf.Reset()
-		if sig == 0 {
-			fmt.Fprint(&conn.outbuf, "$vCont;c")
-		} else {
-			fmt.Fprintf(&conn.outbuf, "$vCont;C%02x", sig)
+		fmt.Fprintf(&conn.outbuf, "$vCont")
+		for _, th := range threads {
+			if th.sig != 0 {
+				fmt.Fprintf(&conn.outbuf, ";C%02x:%s", th.sig, th.strID)
+			}
 		}
+		fmt.Fprintf(&conn.outbuf, ";c")
 	} else {
 		if err := conn.selectThread('c', "p-1.-1", "resume"); err != nil {
 			return "", 0, err
@@ -564,21 +582,54 @@ func (conn *gdbConn) resume(sig uint8, tu *threadUpdater) (string, uint8, error)
 }
 
 // step executes a 'vCont' command on the specified thread with 's' action.
-func (conn *gdbConn) step(threadID string, tu *threadUpdater) (string, uint8, error) {
-	if conn.direction == proc.Forward {
-		conn.outbuf.Reset()
-		fmt.Fprintf(&conn.outbuf, "$vCont;s:%s", threadID)
-	} else {
+func (conn *gdbConn) step(threadID string, tu *threadUpdater, ignoreFaultSignal bool) error {
+	if conn.direction != proc.Forward {
 		if err := conn.selectThread('c', threadID, "step"); err != nil {
-			return "", 0, err
+			return err
 		}
 		conn.outbuf.Reset()
 		fmt.Fprint(&conn.outbuf, "$bs")
+		if err := conn.send(conn.outbuf.Bytes()); err != nil {
+			return err
+		}
+		_, _, err := conn.waitForvContStop("singlestep", threadID, tu)
+		return err
 	}
-	if err := conn.send(conn.outbuf.Bytes()); err != nil {
-		return "", 0, err
+	var sig uint8 = 0
+	for {
+		conn.outbuf.Reset()
+		if sig == 0 {
+			fmt.Fprintf(&conn.outbuf, "$vCont;s:%s", threadID)
+		} else {
+			fmt.Fprintf(&conn.outbuf, "$vCont;S%02x:%s", sig, threadID)
+		}
+		if err := conn.send(conn.outbuf.Bytes()); err != nil {
+			return err
+		}
+		if tu != nil {
+			tu.Reset()
+		}
+		var err error
+		_, sig, err = conn.waitForvContStop("singlestep", threadID, tu)
+		if err != nil {
+			return err
+		}
+		switch sig {
+		case faultSignal:
+			if ignoreFaultSignal { // we attempting to read the TLS, a fault here should be ignored
+				return nil
+			}
+		case interruptSignal, breakpointSignal, stopSignal:
+			return nil
+		case childSignal: // stop on debugserver but SIGCHLD on lldb-server/linux
+			if conn.isDebugserver {
+				return nil
+			}
+		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
+			return nil
+		}
+		// any other signal is propagated to the inferior
 	}
-	return conn.waitForvContStop("singlestep", threadID, tu)
 }
 
 var threadBlockedError = errors.New("thread blocked")
@@ -683,7 +734,7 @@ func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpd
 			semicolon = len(resp)
 		}
 		status, _ := strconv.ParseUint(string(resp[1:semicolon]), 16, 8)
-		return false, stopPacket{}, proc.ProcessExitedError{Pid: conn.pid, Status: int(status)}
+		return false, stopPacket{}, proc.ErrProcessExited{Pid: conn.pid, Status: int(status)}
 
 	case 'N':
 		// we were singlestepping the thread and the thread exited
@@ -865,6 +916,10 @@ func writeAsciiBytes(w io.Writer, data []byte) {
 
 // executes 'M' (write memory) command
 func (conn *gdbConn) writeMemory(addr uintptr, data []byte) (written int, err error) {
+	if len(data) == 0 {
+		// LLDB can't parse requests for 0-length writes and hangs if we emit them
+		return 0, nil
+	}
 	conn.outbuf.Reset()
 	//TODO(aarzilli): do not send packets larger than conn.PacketSize
 	fmt.Fprintf(&conn.outbuf, "$M%x,%x:", addr, len(data))
@@ -988,8 +1043,7 @@ func (conn *gdbConn) send(cmd []byte) error {
 	// append checksum to packet
 	cmd = append(cmd, '#')
 	sum := checksum(cmd)
-	cmd = append(cmd, hexdigit[sum>>4])
-	cmd = append(cmd, hexdigit[sum&0xf])
+	cmd = append(cmd, hexdigit[sum>>4], hexdigit[sum&0xf])
 
 	attempt := 0
 	for {

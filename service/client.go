@@ -3,7 +3,7 @@ package service
 import (
 	"time"
 
-	"github.com/derekparker/delve/service/api"
+	"github.com/go-delve/delve/service/api"
 )
 
 // Client represents a debugger service client. All client methods are
@@ -18,10 +18,10 @@ type Client interface {
 	// Detach detaches the debugger, optionally killing the process.
 	Detach(killProcess bool) error
 
-	// Restarts program.
-	Restart() ([]api.DiscardedBreakpoint, error)
+	// Restarts program. Set true if you want to rebuild the process we are debugging.
+	Restart(rebuild bool) ([]api.DiscardedBreakpoint, error)
 	// Restarts program from the specified position.
-	RestartFrom(pos string, resetArgs bool, newArgs []string) ([]api.DiscardedBreakpoint, error)
+	RestartFrom(rerecord bool, pos string, resetArgs bool, newArgs []string, rebuild bool) ([]api.DiscardedBreakpoint, error)
 
 	// GetState returns the current debugger state.
 	GetState() (*api.DebuggerState, error)
@@ -32,15 +32,27 @@ type Client interface {
 	Continue() <-chan *api.DebuggerState
 	// Rewind resumes process execution backwards.
 	Rewind() <-chan *api.DebuggerState
+	// DirecitonCongruentContinue resumes process execution, if a reverse next, step or stepout operation is in progress it will resume execution backward.
+	DirectionCongruentContinue() <-chan *api.DebuggerState
 	// Next continues to the next source line, not entering function calls.
 	Next() (*api.DebuggerState, error)
+	// ReverseNext continues backward to the previous line of source code, not entering function calls.
+	ReverseNext() (*api.DebuggerState, error)
 	// Step continues to the next source line, entering function calls.
 	Step() (*api.DebuggerState, error)
-	// StepOut continues to the return address of the current function
+	// ReverseStep continues backward to the previous line of source code, entering function calls.
+	ReverseStep() (*api.DebuggerState, error)
+	// StepOut continues to the return address of the current function.
 	StepOut() (*api.DebuggerState, error)
+	// ReverseStepOut continues backward to the calle rof the current function.
+	ReverseStepOut() (*api.DebuggerState, error)
+	// Call resumes process execution while making a function call.
+	Call(goroutineID int, expr string, unsafe bool) (*api.DebuggerState, error)
 
 	// SingleStep will step a single cpu instruction.
 	StepInstruction() (*api.DebuggerState, error)
+	// ReverseSingleStep will reverse step a single cpu instruction.
+	ReverseStepInstruction() (*api.DebuggerState, error)
 	// SwitchThread switches the current thread context.
 	SwitchThread(threadID int) (*api.DebuggerState, error)
 	// SwitchGoroutine switches the current goroutine (and the current thread as well)
@@ -89,14 +101,19 @@ type Client interface {
 	ListLocalVariables(scope api.EvalScope, cfg api.LoadConfig) ([]api.Variable, error)
 	// ListFunctionArgs lists all arguments to the current function.
 	ListFunctionArgs(scope api.EvalScope, cfg api.LoadConfig) ([]api.Variable, error)
-	// ListRegisters lists registers and their values.
-	ListRegisters(threadID int, includeFp bool) (api.Registers, error)
+	// ListThreadRegisters lists registers and their values, for the given thread.
+	ListThreadRegisters(threadID int, includeFp bool) (api.Registers, error)
+	// ListScopeRegisters lists registers and their values, for the given scope.
+	ListScopeRegisters(scope api.EvalScope, includeFp bool) (api.Registers, error)
 
 	// ListGoroutines lists all goroutines.
-	ListGoroutines() ([]*api.Goroutine, error)
+	ListGoroutines(start, count int) ([]*api.Goroutine, int, error)
 
 	// Returns stacktrace
-	Stacktrace(int, int, *api.LoadConfig) ([]api.Stackframe, error)
+	Stacktrace(goroutineID int, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
+
+	// Returns ancestor stacktraces
+	Ancestors(goroutineID int, numAncestors int, depth int) ([]api.Ancestor, error)
 
 	// Returns whether we attached to a running process or not
 	AttachedToExistingProcess() bool
@@ -112,7 +129,8 @@ type Client interface {
 	// * <line> returns a location for a line in the current file
 	// * *<address> returns the location corresponding to the specified address
 	// NOTE: this function does not actually set breakpoints.
-	FindLocation(scope api.EvalScope, loc string) ([]api.Location, error)
+	// If findInstruction is true FindLocation will only return locations that correspond to instructions.
+	FindLocation(scope api.EvalScope, loc string, findInstruction bool) ([]api.Location, error)
 
 	// Disassemble code between startPC and endPC
 	DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
@@ -136,7 +154,21 @@ type Client interface {
 	// IsMulticlien returns true if the headless instance is multiclient.
 	IsMulticlient() bool
 
+	// ListDynamicLibraries returns a list of loaded dynamic libraries.
+	ListDynamicLibraries() ([]api.Image, error)
+
+	// ExamineMemory returns the raw memory stored at the given address.
+	// The amount of data to be read is specified by length which must be less than or equal to 1000.
+	// This function will return an error if it reads less than `length` bytes.
+	ExamineMemory(address uintptr, length int) ([]byte, error)
+
+	// StopRecording stops a recording if one is in progress.
+	StopRecording() error
+
 	// Disconnect closes the connection to the server without sending a Detach request first.
 	// If cont is true a continue command will be sent instead.
 	Disconnect(cont bool) error
+
+	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
+	CallAPI(method string, args, reply interface{}) error
 }

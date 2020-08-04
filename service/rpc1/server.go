@@ -4,13 +4,19 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/derekparker/delve/pkg/proc"
-	"github.com/derekparker/delve/service"
-	"github.com/derekparker/delve/service/api"
-	"github.com/derekparker/delve/service/debugger"
+	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/service"
+	"github.com/go-delve/delve/service/api"
+	"github.com/go-delve/delve/service/debugger"
 )
 
-var defaultLoadConfig = proc.LoadConfig{true, 1, 64, 64, -1}
+var defaultLoadConfig = proc.LoadConfig{
+	FollowPointers:     true,
+	MaxVariableRecurse: 1,
+	MaxStringLen:       64,
+	MaxArrayValues:     64,
+	MaxStructFields:    -1,
+}
 
 type RPCServer struct {
 	// config is all the information necessary to start the debugger and server.
@@ -37,10 +43,10 @@ func (s *RPCServer) Detach(kill bool, ret *int) error {
 }
 
 func (s *RPCServer) Restart(arg1 interface{}, arg2 *int) error {
-	if s.config.AttachPid != 0 {
+	if s.config.Debugger.AttachPid != 0 {
 		return errors.New("cannot restart process Delve did not create")
 	}
-	_, err := s.debugger.Restart("", false, nil)
+	_, err := s.debugger.Restart(false, "", false, nil, false)
 	return err
 }
 
@@ -87,7 +93,7 @@ func (s *RPCServer) StacktraceGoroutine(args *StacktraceGoroutineArgs, locations
 	if args.Full {
 		loadcfg = &defaultLoadConfig
 	}
-	locs, err := s.debugger.Stacktrace(args.Id, args.Depth, loadcfg)
+	locs, err := s.debugger.Stacktrace(args.Id, args.Depth, 0, loadcfg)
 	if err != nil {
 		return err
 	}
@@ -204,7 +210,7 @@ func (s *RPCServer) ListRegisters(arg interface{}, registers *string) error {
 		return err
 	}
 
-	regs, err := s.debugger.Registers(state.CurrentThread.ID, false)
+	regs, err := s.debugger.Registers(state.CurrentThread.ID, nil, false)
 	if err != nil {
 		return err
 	}
@@ -283,7 +289,7 @@ func (s *RPCServer) ListTypes(filter string, types *[]string) error {
 }
 
 func (s *RPCServer) ListGoroutines(arg interface{}, goroutines *[]*api.Goroutine) error {
-	gs, err := s.debugger.Goroutines()
+	gs, _, err := s.debugger.Goroutines(0, 0)
 	if err != nil {
 		return err
 	}
@@ -292,7 +298,7 @@ func (s *RPCServer) ListGoroutines(arg interface{}, goroutines *[]*api.Goroutine
 }
 
 func (c *RPCServer) AttachedToExistingProcess(arg interface{}, answer *bool) error {
-	if c.config.AttachPid != 0 {
+	if c.config.Debugger.AttachPid != 0 {
 		*answer = true
 	}
 	return nil
@@ -305,7 +311,7 @@ type FindLocationArgs struct {
 
 func (c *RPCServer) FindLocation(args FindLocationArgs, answer *[]api.Location) error {
 	var err error
-	*answer, err = c.debugger.FindLocation(args.Scope, args.Loc)
+	*answer, err = c.debugger.FindLocation(args.Scope, args.Loc, false)
 	return err
 }
 
@@ -317,6 +323,6 @@ type DisassembleRequest struct {
 
 func (c *RPCServer) Disassemble(args DisassembleRequest, answer *api.AsmInstructions) error {
 	var err error
-	*answer, err = c.debugger.Disassemble(args.Scope, args.StartPC, args.EndPC, args.Flavour)
+	*answer, err = c.debugger.Disassemble(args.Scope.GoroutineID, args.StartPC, args.EndPC, args.Flavour)
 	return err
 }

@@ -1,8 +1,8 @@
 package main
 
 import (
-	"dir0/pkg"
 	"fmt"
+	"github.com/go-delve/delve/_fixtures/internal/dir0/pkg"
 	"runtime"
 )
 

@@ -7,26 +7,29 @@ import (
 	"bytes"
 	"encoding/binary"
 
-	"github.com/derekparker/delve/pkg/dwarf/util"
+	"github.com/go-delve/delve/pkg/dwarf/util"
 )
 
 type parsefunc func(*parseContext) parsefunc
 
 type parseContext struct {
+	staticBase uint64
+
 	buf     *bytes.Buffer
 	entries FrameDescriptionEntries
 	common  *CommonInformationEntry
 	frame   *FrameDescriptionEntry
 	length  uint32
+	ptrSize int
 }
 
 // Parse takes in data (a byte slice) and returns a slice of
 // commonInformationEntry structures. Each commonInformationEntry
 // has a slice of frameDescriptionEntry structures.
-func Parse(data []byte, order binary.ByteOrder) FrameDescriptionEntries {
+func Parse(data []byte, order binary.ByteOrder, staticBase uint64, ptrSize int) FrameDescriptionEntries {
 	var (
 		buf  = bytes.NewBuffer(data)
-		pctx = &parseContext{buf: buf, entries: NewFrameIndex()}
+		pctx = &parseContext{buf: buf, entries: newFrameIndex(), staticBase: staticBase, ptrSize: ptrSize}
 	)
 
 	for fn := parselength; buf.Len() != 0; {
@@ -57,7 +60,7 @@ func parselength(ctx *parseContext) parsefunc {
 	ctx.length -= 4 // take off the length of the CIE id / CIE pointer.
 
 	if cieEntry(data) {
-		ctx.common = &CommonInformationEntry{Length: ctx.length}
+		ctx.common = &CommonInformationEntry{Length: ctx.length, staticBase: ctx.staticBase}
 		return parseCIE
 	}
 
@@ -66,10 +69,14 @@ func parselength(ctx *parseContext) parsefunc {
 }
 
 func parseFDE(ctx *parseContext) parsefunc {
+	var num uint64
 	r := ctx.buf.Next(int(ctx.length))
 
-	ctx.frame.begin = binary.LittleEndian.Uint64(r[:8])
-	ctx.frame.end = binary.LittleEndian.Uint64(r[8:16])
+	reader := bytes.NewReader(r)
+	num, _ = util.ReadUintRaw(reader, binary.LittleEndian, ctx.ptrSize)
+	ctx.frame.begin = num + ctx.staticBase
+	num, _ = util.ReadUintRaw(reader, binary.LittleEndian, ctx.ptrSize)
+	ctx.frame.size = num
 
 	// Insert into the tree after setting address range begin
 	// otherwise compares won't work.
@@ -78,7 +85,7 @@ func parseFDE(ctx *parseContext) parsefunc {
 	// The rest of this entry consists of the instructions
 	// so we can just grab all of the data from the buffer
 	// cursor to length.
-	ctx.frame.Instructions = r[16:]
+	ctx.frame.Instructions = r[2*ctx.ptrSize:]
 	ctx.length = 0
 
 	return parselength
@@ -88,7 +95,7 @@ func parseCIE(ctx *parseContext) parsefunc {
 	data := ctx.buf.Next(int(ctx.length))
 	buf := bytes.NewBuffer(data)
 	// parse version
-	ctx.common.Version = data[0]
+	ctx.common.Version, _ = buf.ReadByte()
 
 	// parse augmentation
 	ctx.common.Augmentation, _ = util.ParseString(buf)
